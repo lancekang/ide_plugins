@@ -1,4 +1,4 @@
-export type ConflictStatus = 'conflict' | 'ours-only' | 'theirs-only' | 'both-identical';
+export type ChunkChoice = 'left' | 'right' | 'both' | 'custom' | 'base' | 'none';
 
 export interface ConflictChunk {
   id: string;
@@ -12,25 +12,44 @@ export interface ConflictChunk {
   baseContent: string;
   leftContent: string;
   rightContent: string;
-  // Resolution state
   resolved: boolean;
-  chosen: 'left' | 'right' | 'both' | 'custom' | 'base' | 'none';
-  resultContent?: string;
+  chosen: ChunkChoice;
+  /** Lines written for this hunk. Empty means a deletion, not a blank line. */
+  resultLines: string[];
+  leftEmpty: boolean;
+  rightEmpty: boolean;
+}
+
+export interface MergeBlock {
+  kind: 'context' | 'hunk';
+  /** Context lines. Empty for hunks; hunk text lives on the chunk. */
+  lines: string[];
+  chunkId?: string;
 }
 
 export interface MergeFileData {
   filePath: string;
   fileName: string;
   relativeFilePath: string;
-  leftTitle: string;    // e.g. "Current Branch (HEAD / main)"
-  rightTitle: string;   // e.g. "Incoming Branch (feature/xyz)"
-  baseTitle: string;    // e.g. "Base / Common Ancestor"
+  leftTitle: string;
+  rightTitle: string;
+  baseTitle: string;
   baseContent: string;
   leftContent: string;
   rightContent: string;
   initialResultContent: string;
   chunks: ConflictChunk[];
+  blocks: MergeBlock[];
   sourceType: 'git-index' | 'marker-parsing';
+  eol: '\n' | '\r\n';
+  trailingNewline: boolean;
+  /** Set when conflict markers are not closed. The original text is kept. */
+  parseError?: string;
+  /** Unmerged in the index, while the working tree has no conflict markers. */
+  manualResolution: boolean;
+  diskExisted: boolean;
+  /** Working tree at the moment the view opened. Omitted from the webview. */
+  diskSnapshot?: string;
 }
 
 export interface ConflictFileInfo {

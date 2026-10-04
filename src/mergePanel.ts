@@ -1,7 +1,81 @@
 import * as vscode from 'vscode';
-import * as path from 'path';
-import { MergeFileData } from './types.js';
+import * as fs from 'fs';
+import { ConflictChunk, MergeBlock, MergeFileData } from './types.js';
+import { describeUnresolved, serializeMerge } from './diffEngine.js';
 import { GitService } from './gitService.js';
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function asBlocks(value: unknown): MergeBlock[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const blocks: MergeBlock[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== 'object') {
+      return undefined;
+    }
+    const record = item as { kind?: unknown; lines?: unknown; chunkId?: unknown };
+    if (record.kind !== 'context' && record.kind !== 'hunk') {
+      return undefined;
+    }
+    if (!Array.isArray(record.lines) || record.lines.some(line => typeof line !== 'string')) {
+      return undefined;
+    }
+    if (record.chunkId !== undefined && typeof record.chunkId !== 'string') {
+      return undefined;
+    }
+    blocks.push({
+      kind: record.kind,
+      lines: record.lines,
+      chunkId: record.chunkId
+    });
+  }
+  return blocks;
+}
+
+function asChunks(value: unknown, original: ConflictChunk[]): ConflictChunk[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const incoming = new Map<string, string[]>();
+  for (const item of value) {
+    if (!item || typeof item !== 'object') {
+      return undefined;
+    }
+    const record = item as { id?: unknown; resultLines?: unknown };
+    if (typeof record.id !== 'string' || !Array.isArray(record.resultLines)) {
+      return undefined;
+    }
+    if (record.resultLines.some(line => typeof line !== 'string')) {
+      return undefined;
+    }
+    incoming.set(record.id, record.resultLines);
+  }
+  if (incoming.size !== original.length) {
+    return undefined;
+  }
+  const next: ConflictChunk[] = [];
+  for (const chunk of original) {
+    const lines = incoming.get(chunk.id);
+    if (!lines) {
+      return undefined;
+    }
+    next.push({ ...chunk, resultLines: lines });
+  }
+  return next;
+}
 
 export class MergePanel {
   public static currentPanel: MergePanel | undefined;
@@ -39,59 +113,27 @@ export class MergePanel {
     this._panel = panel;
     this._extensionUri = extensionUri;
     this._data = data;
-
     this.update(data);
 
     this._panel.onDidDispose(() => this.dispose(), null, this._disposables);
-
     this._panel.webview.onDidReceiveMessage(
       async (message) => {
-        switch (message.command) {
-          case 'saveAndStage': {
-            const resolvedContent = message.content;
-            const res = await GitService.saveAndStage(this._data.filePath, resolvedContent);
-            if (res.success) {
-              vscode.window.showInformationMessage(`[WebStorm Merge] ${res.message}`);
-              if (res.remainingConflicts > 0) {
-                const pick = await vscode.window.showInformationMessage(
-                  `${res.remainingConflicts} conflicted file(s) remaining. Resolve next?`,
-                  'Next File',
-                  'Done'
-                );
-                if (pick === 'Next File') {
-                  const gitRoot = await GitService.findGitRoot(this._data.filePath);
-                  if (gitRoot) {
-                    const conflicts = await GitService.getConflictedFiles(gitRoot);
-                    if (conflicts.length > 0) {
-                      const nextData = await GitService.loadMergeData(conflicts[0].fsPath);
-                      this.update(nextData);
-                      return;
-                    }
-                  }
-                }
-              }
-              this._panel.dispose();
-            } else {
-              vscode.window.showErrorMessage(`[WebStorm Merge] ${res.message}`);
+        switch (message?.command) {
+          case 'saveAndStage':
+            await this.saveFromWebview(message.blocks, message.chunks);
+            break;
+          case 'info':
+            if (typeof message.text === 'string') {
+              vscode.window.showInformationMessage(message.text);
             }
             break;
-          }
-          case 'openExternalDiff': {
-            vscode.commands.executeCommand('vscode.diff', 
-              vscode.Uri.file(this._data.filePath),
-              vscode.Uri.file(this._data.filePath),
-              `Diff: ${this._data.fileName}`
-            );
+          case 'error':
+            if (typeof message.text === 'string') {
+              vscode.window.showErrorMessage(message.text);
+            }
             break;
-          }
-          case 'info': {
-            vscode.window.showInformationMessage(message.text);
+          default:
             break;
-          }
-          case 'error': {
-            vscode.window.showErrorMessage(message.text);
-            break;
-          }
         }
       },
       null,
@@ -109,60 +151,151 @@ export class MergePanel {
     MergePanel.currentPanel = undefined;
     this._panel.dispose();
     while (this._disposables.length) {
-      const x = this._disposables.pop();
-      if (x) {
-        x.dispose();
+      const item = this._disposables.pop();
+      if (item) {
+        item.dispose();
       }
     }
   }
 
+  private async saveFromWebview(rawBlocks: unknown, rawChunks: unknown) {
+    const blocks = asBlocks(rawBlocks);
+    const chunks = asChunks(rawChunks, this._data.chunks);
+    if (!blocks || !chunks) {
+      vscode.window.showErrorMessage('The merge view sent an unreadable result.');
+      return;
+    }
+
+    let content: string;
+    try {
+      content = serializeMerge(blocks, chunks, this._data.eol, this._data.trailingNewline);
+    } catch (err: unknown) {
+      vscode.window.showErrorMessage(errorText(err));
+      return;
+    }
+
+    const unresolved = describeUnresolved(content);
+    if (unresolved) {
+      vscode.window.showErrorMessage(unresolved);
+      return;
+    }
+
+    const allowed = await this.confirmOverwrite();
+    if (!allowed) {
+      return;
+    }
+
+    const res = await GitService.saveAndStage(this._data.filePath, content);
+    if (!res.success) {
+      vscode.window.showErrorMessage(`[WebStorm Merge] ${res.message}`);
+      return;
+    }
+
+    vscode.window.showInformationMessage(`[WebStorm Merge] ${res.message}`);
+    if (res.remainingConflicts > 0) {
+      const pick = await vscode.window.showInformationMessage(
+        `${res.remainingConflicts} conflicted file(s) remaining. Resolve next?`,
+        'Next File',
+        'Done'
+      );
+      if (pick === 'Next File') {
+        try {
+          const gitRoot = await GitService.findGitRoot(this._data.filePath);
+          if (gitRoot) {
+            const conflicts = await GitService.getConflictedFiles(gitRoot);
+            if (conflicts.length > 0) {
+              const nextData = await GitService.loadMergeData(conflicts[0].fsPath);
+              this.update(nextData);
+              return;
+            }
+          }
+        } catch (err: unknown) {
+          vscode.window.showErrorMessage(`Failed to open the next conflict: ${errorText(err)}`);
+          return;
+        }
+      }
+    }
+    this._panel.dispose();
+  }
+
+  private async confirmOverwrite(): Promise<boolean> {
+    if (!this._data.diskExisted) {
+      return true;
+    }
+    let current: string | undefined;
+    try {
+      if (fs.existsSync(this._data.filePath)) {
+        current = fs.readFileSync(this._data.filePath, 'utf8');
+      }
+    } catch {
+      return true;
+    }
+    const changedSinceOpen = current !== undefined && current !== this._data.diskSnapshot;
+    if (!this._data.manualResolution && !changedSinceOpen) {
+      return true;
+    }
+    const reason = this._data.manualResolution
+      ? 'The working tree has edits without conflict markers.'
+      : 'The file changed on disk after this merge view opened.';
+    const pick = await vscode.window.showWarningMessage(
+      `${reason} Overwrite it and stage the merge result?`,
+      { modal: true },
+      'Overwrite'
+    );
+    return pick === 'Overwrite';
+  }
+
   private _getHtmlForWebview(data: MergeFileData): string {
-    const rawDataJson = JSON.stringify(data).replace(/</g, '\\u003c');
+    const view = { ...data, diskSnapshot: undefined };
+    const rawDataJson = JSON.stringify(view).replace(/</g, '\\u003c');
+    const fileName = escapeHtml(data.fileName);
+    const leftTitle = escapeHtml(data.leftTitle);
+    const rightTitle = escapeHtml(data.rightTitle);
+    const baseTitle = escapeHtml(data.baseTitle);
+    const sourceLabel = data.sourceType === 'git-index'
+      ? 'Git index (base / ours / theirs)'
+      : 'Conflict marker parsing';
 
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>WebStorm Merge: ${data.fileName}</title>
+  <title>WebStorm Merge: ${fileName}</title>
   <style>
     :root {
-      --bg: var(--vscode-editor-background, #1e1e1e);
-      --fg: var(--vscode-editor-foreground, #d4d4d4);
-      --border-color: var(--vscode-panel-border, #333333);
-      --header-bg: var(--vscode-editorGroupHeader-tabsBackground, #252526);
-      --toolbar-bg: var(--vscode-sideBar-background, #1e1e20);
-      --button-bg: var(--vscode-button-background, #0e639c);
-      --button-fg: var(--vscode-button-foreground, #ffffff);
-      --button-hover: var(--vscode-button-hoverBackground, #1177bb);
-      --secondary-btn-bg: var(--vscode-button-secondaryBackground, #3a3d41);
-      --secondary-btn-fg: var(--vscode-button-secondaryForeground, #ffffff);
-      --secondary-btn-hover: var(--vscode-button-secondaryHoverBackground, #45494e);
-      --accent-green: #388e3c;
-      --accent-blue: #1976d2;
-      --accent-red: #d32f2f;
-      --accent-orange: #f57c00;
-      --conflict-bg: rgba(239, 83, 80, 0.18);
-      --conflict-border: #ef5350;
-      --left-diff-bg: rgba(67, 160, 71, 0.15);
-      --left-border: #43a047;
-      --right-diff-bg: rgba(33, 150, 243, 0.15);
-      --right-border: #2196f3;
-      --font-code: var(--vscode-editor-font-family, Consolas, 'Courier New', monospace);
+      --bg: var(--vscode-editor-background);
+      --fg: var(--vscode-editor-foreground);
+      --border-color: var(--vscode-panel-border, transparent);
+      --header-bg: var(--vscode-editorGroupHeader-tabsBackground);
+      --toolbar-bg: var(--vscode-sideBar-background);
+      --button-bg: var(--vscode-button-background);
+      --button-fg: var(--vscode-button-foreground);
+      --button-hover: var(--vscode-button-hoverBackground);
+      --secondary-btn-bg: var(--vscode-button-secondaryBackground);
+      --secondary-btn-fg: var(--vscode-button-secondaryForeground);
+      --secondary-btn-hover: var(--vscode-button-secondaryHoverBackground);
+      --focus: var(--vscode-focusBorder);
+      --font-code: var(--vscode-editor-font-family, Consolas, monospace);
       --font-size: var(--vscode-editor-font-size, 13px);
-      --line-height: 20px;
+      --ours: var(--vscode-gitDecoration-addedResourceForeground);
+      --theirs: var(--vscode-gitDecoration-modifiedResourceForeground);
+      --conflict: var(--vscode-editorWarning-foreground);
+      --muted: var(--vscode-descriptionForeground);
+      --line-bg: var(--vscode-editor-background);
+      --ours-bg: var(--vscode-diffEditor-insertedLineBackground, var(--vscode-diffEditor-insertedTextBackground));
+      --theirs-bg: var(--vscode-editor-selectionHighlightBackground, var(--vscode-diffEditor-diagonalFill));
+      --conflict-bg: var(--vscode-diffEditor-removedLineBackground, var(--vscode-diffEditor-removedTextBackground));
+      --row-h: 20px;
+      --action-h: 28px;
     }
 
-    * {
-      box-sizing: border-box;
-      margin: 0;
-      padding: 0;
-    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
 
     body {
-      background-color: var(--bg);
+      background: var(--bg);
       color: var(--fg);
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+      font-family: var(--vscode-font-family, sans-serif);
       font-size: 13px;
       height: 100vh;
       overflow: hidden;
@@ -170,856 +303,629 @@ export class MergePanel {
       flex-direction: column;
     }
 
-    /* TOP TOOLBAR - WebStorm Style */
+    .banner {
+      padding: 8px 14px;
+      background: var(--vscode-inputValidation-warningBackground);
+      color: var(--vscode-inputValidation-warningForeground, var(--fg));
+      border-bottom: 1px solid var(--vscode-inputValidation-warningBorder, var(--border-color));
+    }
+
     .toolbar {
       background: var(--toolbar-bg);
       border-bottom: 1px solid var(--border-color);
-      padding: 8px 14px;
+      padding: 8px 12px;
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 12px;
-      user-select: none;
-      box-shadow: 0 2px 4px rgba(0,0,0,0.15);
-      z-index: 100;
+      gap: 8px;
       flex-wrap: wrap;
     }
 
     .toolbar-left, .toolbar-center, .toolbar-right {
       display: flex;
       align-items: center;
-      gap: 8px;
-    }
-
-    .file-badge {
-      display: inline-flex;
-      align-items: center;
       gap: 6px;
-      font-weight: 600;
-      font-size: 13px;
-      color: var(--fg);
-      background: rgba(255, 255, 255, 0.05);
-      padding: 4px 10px;
-      border-radius: 4px;
+      flex-wrap: wrap;
+    }
+
+    .file-badge, .status-badge {
+      padding: 3px 8px;
       border: 1px solid var(--border-color);
+      border-radius: 4px;
+      font-size: 12px;
     }
 
-    .status-badge {
-      padding: 4px 10px;
-      border-radius: 12px;
-      font-size: 11px;
-      font-weight: 700;
-      letter-spacing: 0.3px;
-      display: inline-flex;
-      align-items: center;
-      gap: 5px;
-    }
+    .status-badge.has-conflicts { color: var(--conflict); }
+    .status-badge.all-resolved { color: var(--ours); }
 
-    .status-badge.has-conflicts {
-      background: var(--accent-orange);
-      color: #fff;
-    }
-
-    .status-badge.all-resolved {
-      background: var(--accent-green);
-      color: #fff;
+    button {
+      font: inherit;
+      color: inherit;
     }
 
     .btn {
       background: var(--secondary-btn-bg);
       color: var(--secondary-btn-fg);
-      border: 1px solid rgba(255,255,255,0.08);
-      padding: 5px 10px;
+      border: 1px solid transparent;
+      padding: 4px 8px;
       border-radius: 4px;
       cursor: pointer;
       font-size: 12px;
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      font-weight: 500;
-      transition: all 0.15s ease;
-      white-space: nowrap;
     }
 
-    .btn:hover {
-      background: var(--secondary-btn-hover);
-    }
+    .btn:hover { background: var(--secondary-btn-hover); }
+    .btn:focus-visible { outline: 1px solid var(--focus); outline-offset: 1px; }
 
     .btn-primary {
       background: var(--button-bg);
       color: var(--button-fg);
-      font-weight: 600;
     }
 
-    .btn-primary:hover {
-      background: var(--button-hover);
-    }
+    .btn-primary:hover { background: var(--button-hover); }
 
-    .btn-success {
-      background: #2e7d32;
-      color: #ffffff;
-      font-weight: 600;
-      box-shadow: 0 1px 3px rgba(0,0,0,0.3);
-    }
+    .toggle-group { display: inline-flex; border: 1px solid var(--border-color); border-radius: 4px; overflow: hidden; }
+    .toggle-group .btn { border-radius: 0; }
+    .toggle-group .btn.active { background: var(--button-bg); color: var(--button-fg); }
 
-    .btn-success:hover {
-      background: #388e3c;
-    }
-
-    .btn-magic {
-      background: linear-gradient(135deg, #7b1fa2, #512da8);
-      color: #ffffff;
-      font-weight: 600;
-      border: 1px solid #9c27b0;
-      box-shadow: 0 2px 5px rgba(123, 31, 162, 0.3);
-    }
-
-    .btn-magic:hover {
-      background: linear-gradient(135deg, #8e24aa, #5e35b1);
-    }
-
-    .toggle-group {
-      display: inline-flex;
-      border: 1px solid var(--border-color);
-      border-radius: 4px;
-      overflow: hidden;
-    }
-
-    .toggle-group .btn {
-      border: none;
-      border-radius: 0;
-      padding: 5px 9px;
-    }
-
-    .toggle-group .btn.active {
-      background: var(--button-bg);
-      color: #fff;
-    }
-
-    /* MAIN EDITORS CONTAINER */
     .merge-body {
       flex: 1;
-      display: flex;
-      overflow: hidden;
-      position: relative;
+      min-height: 0;
+      display: grid;
     }
 
-    /* 3-Column Layout */
-    .merge-body.layout-3col {
-      flex-direction: row;
+    .layout-3col {
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr) minmax(0, 1fr);
+      grid-template-rows: minmax(0, 1fr);
+      grid-template-areas: "left center right";
     }
 
-    .merge-body.layout-3col .pane-left {
-      width: 32%;
-      border-right: 1px solid var(--border-color);
+    .layout-2row {
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      grid-template-rows: minmax(0, 1fr) minmax(0, 1.1fr);
+      grid-template-areas:
+        "left right"
+        "center center";
     }
 
-    .merge-body.layout-3col .pane-center {
-      width: 36%;
-      border-right: 1px solid var(--border-color);
-    }
+    .pane-left { grid-area: left; }
+    .pane-center { grid-area: center; }
+    .pane-right { grid-area: right; }
 
-    .merge-body.layout-3col .pane-right {
-      width: 32%;
-    }
+    .layout-3col .pane-left,
+    .layout-3col .pane-center,
+    .layout-2row .pane-left { border-right: 1px solid var(--border-color); }
+    .layout-2row .pane-center { border-top: 1px solid var(--border-color); }
 
-    /* 2-Row Split Layout */
-    .merge-body.layout-2row {
-      flex-direction: column;
-    }
-
-    .merge-body.layout-2row .top-row {
-      display: flex;
-      flex-direction: row;
-      height: 48%;
-      border-bottom: 2px solid var(--border-color);
-    }
-
-    .merge-body.layout-2row .top-row .pane-left {
-      width: 50%;
-      border-right: 1px solid var(--border-color);
-    }
-
-    .merge-body.layout-2row .top-row .pane-right {
-      width: 50%;
-    }
-
-    .merge-body.layout-2row .bottom-row {
-      height: 52%;
-      display: flex;
-      flex-direction: column;
-    }
-
-    .merge-body.layout-2row .bottom-row .pane-center {
-      width: 100%;
-      height: 100%;
-    }
-
-    /* PANE COMMON */
     .editor-pane {
+      min-width: 0;
+      min-height: 0;
       display: flex;
       flex-direction: column;
-      height: 100%;
       background: var(--bg);
-      overflow: hidden;
     }
 
     .pane-header {
       background: var(--header-bg);
       border-bottom: 1px solid var(--border-color);
-      padding: 6px 12px;
+      padding: 6px 10px;
       font-size: 11px;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
+      font-weight: 650;
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .pane-header .tag { color: var(--muted); font-weight: 500; }
+
+    .pane-scroll {
+      position: relative;
+      flex: 1;
+      min-height: 0;
+      overflow: auto;
+    }
+
+    .block { width: 100%; }
+    .block.active { outline: 1px solid var(--focus); outline-offset: -1px; }
+
+    .hunk-actions {
+      height: var(--action-h);
       display: flex;
       align-items: center;
-      justify-content: space-between;
-      user-select: none;
+      gap: 4px;
+      padding: 0 6px;
+      border-bottom: 1px solid var(--border-color);
+      background: var(--header-bg);
     }
 
-    .pane-header .badge {
-      padding: 2px 7px;
-      border-radius: 4px;
-      font-size: 10px;
-      font-weight: bold;
-    }
+    .hunk.conflict { background: var(--conflict-bg); }
+    .hunk.diff-left { background: var(--ours-bg); }
+    .hunk.diff-right { background: var(--theirs-bg); }
 
-    .pane-left .badge {
-      background: var(--left-border);
-      color: #fff;
-    }
-
-    .pane-center .badge {
-      background: var(--accent-orange);
-      color: #fff;
-    }
-
-    .pane-right .badge {
-      background: var(--right-border);
-      color: #fff;
-    }
-
-    /* EDITOR SCROLL AREA */
-    .pane-content {
-      flex: 1;
-      overflow: auto;
-      display: flex;
+    .code-line, .result-area, #lineProbe {
       font-family: var(--font-code);
       font-size: var(--font-size);
-      line-height: var(--line-height);
-      position: relative;
-    }
-
-    /* Gutter and Line Numbers */
-    .gutter {
-      user-select: none;
-      background: rgba(0, 0, 0, 0.12);
-      border-right: 1px solid var(--border-color);
-      padding: 8px 4px;
-      text-align: right;
-      color: var(--vscode-editorLineNumber-foreground, #858585);
-      font-size: 11px;
-      min-width: 42px;
-    }
-
-    .line-number {
-      height: var(--line-height);
-      display: flex;
-      align-items: center;
-      justify-content: flex-end;
-      padding-right: 6px;
-    }
-
-    /* Action Gutter (WebStorm Arrow Buttons » « ✕) */
-    .action-gutter {
-      user-select: none;
-      width: 48px;
-      background: rgba(0, 0, 0, 0.08);
-      border-right: 1px solid var(--border-color);
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      padding-top: 8px;
-    }
-
-    .action-btn-slot {
-      height: var(--line-height);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      width: 100%;
-    }
-
-    .apply-btn {
-      width: 20px;
-      height: 18px;
-      line-height: 18px;
-      text-align: center;
-      border-radius: 3px;
-      cursor: pointer;
-      font-size: 12px;
-      font-weight: 800;
-      color: #fff;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      transition: transform 0.1s, opacity 0.1s;
-    }
-
-    .apply-btn:hover {
-      transform: scale(1.15);
-    }
-
-    .apply-btn.apply-left {
-      background: var(--accent-green);
-    }
-
-    .apply-btn.apply-right {
-      background: var(--accent-blue);
-    }
-
-    .apply-btn.ignore-btn {
-      background: #757575;
-      font-size: 10px;
-      margin-left: 2px;
-    }
-
-    .apply-btn.ignore-btn:hover {
-      background: var(--accent-red);
-    }
-
-    /* Code View Area */
-    .code-view {
-      flex: 1;
-      padding: 8px 0;
-      white-space: pre;
-      overflow-x: auto;
+      line-height: var(--row-h);
     }
 
     .code-line {
-      height: var(--line-height);
-      padding: 0 10px;
-      display: flex;
-      align-items: center;
-    }
-
-    .code-line.conflict-highlight {
-      background-color: var(--conflict-bg);
-      border-left: 3px solid var(--conflict-border);
-    }
-
-    .code-line.left-diff-highlight {
-      background-color: var(--left-diff-bg);
-      border-left: 3px solid var(--left-border);
-    }
-
-    .code-line.right-diff-highlight {
-      background-color: var(--right-diff-bg);
-      border-left: 3px solid var(--right-border);
-    }
-
-    .code-line.active-conflict {
-      box-shadow: inset 0 0 0 1px var(--accent-orange);
-    }
-
-    /* Editable Textarea in Center Pane */
-    .result-editor-wrapper {
-      flex: 1;
-      display: flex;
-      position: relative;
-    }
-
-    .result-textarea {
-      flex: 1;
-      background: transparent;
-      color: var(--fg);
-      font-family: var(--font-code);
-      font-size: var(--font-size);
-      line-height: var(--line-height);
-      padding: 8px 10px;
-      border: none;
-      outline: none;
-      resize: none;
+      height: var(--row-h);
       white-space: pre;
-      overflow: auto;
-      tab-size: 2;
+      padding: 0 8px;
     }
 
-    /* Conflict navigation indicator bar */
-    .conflict-marker-label {
-      background: var(--accent-orange);
-      color: #fff;
-      font-size: 10px;
-      font-weight: 700;
-      padding: 1px 6px;
-      border-radius: 3px;
-      margin-right: 6px;
-      display: inline-block;
+    .code-line.pad { color: var(--muted); }
+
+    .result-area {
+      display: block;
+      width: 100%;
+      margin: 0;
+      padding: 0 8px;
+      border: 0;
+      resize: none;
+      overflow: hidden;
+      white-space: pre;
+      background: transparent;
+      color: inherit;
     }
 
-    /* Keyboard help footer */
+    .result-area:focus { outline: none; }
+
     .status-bar {
-      background: var(--toolbar-bg);
       border-top: 1px solid var(--border-color);
-      padding: 4px 14px;
+      background: var(--toolbar-bg);
+      color: var(--muted);
+      padding: 4px 12px;
       font-size: 11px;
       display: flex;
       justify-content: space-between;
-      color: #888;
-      user-select: none;
+      gap: 12px;
     }
 
-    .status-bar kbd {
-      background: rgba(255,255,255,0.1);
-      padding: 1px 5px;
-      border-radius: 3px;
-      border: 1px solid rgba(255,255,255,0.15);
-      color: var(--fg);
+    kbd {
       font-family: var(--font-code);
+      border: 1px solid var(--border-color);
+      padding: 0 4px;
+      border-radius: 3px;
+    }
+
+    #lineProbe {
+      position: absolute;
+      visibility: hidden;
+      white-space: pre;
+      height: auto;
+      line-height: 1.5;
     }
   </style>
 </head>
 <body>
-
-  <!-- TOP TOOLBAR -->
+  <div id="lineProbe">x</div>
+  <div id="banner" class="banner" hidden></div>
   <div class="toolbar">
     <div class="toolbar-left">
-      <div class="file-badge">
-        <span>📄</span>
-        <span id="lblFileName">${data.fileName}</span>
-      </div>
-      <div id="statusBadge" class="status-badge has-conflicts">
-        <span id="conflictCountIcon">⚡</span>
-        <span id="conflictCountText">Calculating...</span>
-      </div>
-      <div class="toggle-group" title="Navigate between conflict chunks">
-        <button id="btnPrevConflict" class="btn" title="Previous Conflict (Shift+F7 or Alt+Up)">▲ Prev</button>
-        <button id="btnNextConflict" class="btn" title="Next Conflict (F7 or Alt+Down)">▼ Next</button>
-      </div>
-    </div>
-
-    <div class="toolbar-center">
-      <button id="btnMagicWand" class="btn btn-magic" title="WebStorm Magic Wand: Automatically accept all non-conflicting changes from both sides">
-        🪄 Magic Wand (Auto-Resolve)
-      </button>
-      <button id="btnAcceptAllLeft" class="btn" title="Accept all changes from Left (Ours)">
-        »» Accept All Left
-      </button>
-      <button id="btnAcceptAllRight" class="btn" title="Accept all changes from Right (Theirs)">
-        «« Accept All Right
-      </button>
-    </div>
-
-    <div class="toolbar-right">
-      <!-- Layout Switcher: 3-Col vs 2-Row -->
+      <div class="file-badge" id="lblFileName">${fileName}</div>
+      <div id="statusBadge" class="status-badge has-conflicts">Checking conflicts</div>
       <div class="toggle-group">
-        <button id="btnLayout3Col" class="btn active" title="WebStorm Classic 3-Column Layout">⬌ 3-Column</button>
-        <button id="btnLayout2Row" class="btn" title="2-Row Split Layout (Top: Compare, Bottom: Result)">⬍ 2-Row Split</button>
+        <button id="btnPrevConflict" class="btn" type="button" title="Previous unresolved conflict">Prev</button>
+        <button id="btnNextConflict" class="btn" type="button" title="Next unresolved conflict">Next</button>
       </div>
-      <button id="btnToggleSyncScroll" class="btn active" title="Toggle Synchronized Scrolling">
-        🔗 Sync Scroll
-      </button>
-      <button id="btnSaveStage" class="btn btn-success" title="Save file and stage with 'git add' (Ctrl+S)">
-        💾 Apply & Save (git add)
-      </button>
+    </div>
+    <div class="toolbar-center">
+      <button id="btnMagicWand" class="btn" type="button" title="Re-apply every one-sided change">Apply non-conflicts</button>
+      <button id="btnAcceptAllLeft" class="btn" type="button">Accept all ours</button>
+      <button id="btnAcceptAllRight" class="btn" type="button">Accept all theirs</button>
+    </div>
+    <div class="toolbar-right">
+      <div class="toggle-group">
+        <button id="btnLayout3Col" class="btn active" type="button">3 columns</button>
+        <button id="btnLayout2Row" class="btn" type="button">2 rows</button>
+      </div>
+      <button id="btnToggleSyncScroll" class="btn active" type="button">Sync scroll</button>
+      <button id="btnSaveStage" class="btn btn-primary" type="button">Apply and stage</button>
     </div>
   </div>
-
-  <!-- MAIN MERGE BODY -->
   <div id="mergeBody" class="merge-body layout-3col">
-    <!-- LEFT PANE: OURS -->
-    <div class="editor-pane pane-left" id="paneLeft">
-      <div class="pane-header">
-        <span id="titleLeft">${data.leftTitle}</span>
-        <span class="badge">OURS (LOCAL)</span>
-      </div>
-      <div class="pane-content" id="scrollLeft">
-        <div class="gutter" id="gutterLeft"></div>
-        <div class="code-view" id="codeLeft"></div>
-        <div class="action-gutter" id="actionGutterLeft" title="Apply to Result"></div>
-      </div>
-    </div>
-
-    <!-- CENTER PANE: RESULT -->
-    <div class="editor-pane pane-center" id="paneCenter">
-      <div class="pane-header">
-        <span>Result (Merged Output)</span>
-        <span class="badge" style="background:#0e639c;">EDITABLE</span>
-      </div>
-      <div class="pane-content" id="scrollCenter">
-        <div class="gutter" id="gutterCenter"></div>
-        <div class="result-editor-wrapper">
-          <textarea id="resultTextarea" class="result-textarea" spellcheck="false"></textarea>
-        </div>
-      </div>
-    </div>
-
-    <!-- RIGHT PANE: THEIRS -->
-    <div class="editor-pane pane-right" id="paneRight">
-      <div class="pane-header">
-        <span id="titleRight">${data.rightTitle}</span>
-        <span class="badge">THEIRS (INCOMING)</span>
-      </div>
-      <div class="pane-content" id="scrollRight">
-        <div class="action-gutter" id="actionGutterRight" title="Apply to Result"></div>
-        <div class="gutter" id="gutterRight"></div>
-        <div class="code-view" id="codeRight"></div>
-      </div>
-    </div>
+    <section class="editor-pane pane-left">
+      <div class="pane-header"><span id="titleLeft">${leftTitle}</span><span class="tag">Ours</span></div>
+      <div class="pane-scroll" id="scrollLeft"></div>
+    </section>
+    <section class="editor-pane pane-center">
+      <div class="pane-header"><span>Result</span><span class="tag">${baseTitle}</span></div>
+      <div class="pane-scroll" id="scrollCenter"></div>
+    </section>
+    <section class="editor-pane pane-right">
+      <div class="pane-header"><span id="titleRight">${rightTitle}</span><span class="tag">Theirs</span></div>
+      <div class="pane-scroll" id="scrollRight"></div>
+    </section>
   </div>
-
-  <!-- STATUS FOOTER -->
   <div class="status-bar">
-    <div>
-      Shortcuts: <kbd>F7</kbd> Next Conflict &nbsp;|&nbsp; <kbd>Shift+F7</kbd> Prev Conflict &nbsp;|&nbsp; <kbd>Ctrl+S</kbd> Save & git add
-    </div>
-    <div id="sourceTypeInfo">
-      Source: ${data.sourceType === 'git-index' ? 'Git Index (3-Way Base/Ours/Theirs)' : 'Conflict Marker Parsing'}
-    </div>
+    <div><kbd>F7</kbd> next <kbd>Shift+F7</kbd> previous <kbd>Ctrl+S</kbd> stage <kbd>Tab</kbd> indent</div>
+    <div>${escapeHtml(sourceLabel)}</div>
   </div>
-
   <script>
     const vscode = acquireVsCodeApi();
     const rawData = ${rawDataJson};
+    const ACTION = 28;
 
-    let state = {
+    const state = {
       chunks: rawData.chunks || [],
-      leftContent: rawData.leftContent || '',
-      rightContent: rawData.rightContent || '',
-      baseContent: rawData.baseContent || '',
-      resultContent: rawData.initialResultContent || '',
-      currentConflictIndex: 0,
+      blocks: rawData.blocks || [],
+      eol: rawData.eol === '\\r\\n' ? '\\r\\n' : '\\n',
+      trailingNewline: !!rawData.trailingNewline,
       syncScroll: true,
-      layout: '3col'
+      currentId: ''
     };
 
-    // DOM Elements
     const mergeBody = document.getElementById('mergeBody');
     const scrollLeft = document.getElementById('scrollLeft');
     const scrollCenter = document.getElementById('scrollCenter');
     const scrollRight = document.getElementById('scrollRight');
-
-    const gutterLeft = document.getElementById('gutterLeft');
-    const codeLeft = document.getElementById('codeLeft');
-    const actionGutterLeft = document.getElementById('actionGutterLeft');
-
-    const gutterRight = document.getElementById('gutterRight');
-    const codeRight = document.getElementById('codeRight');
-    const actionGutterRight = document.getElementById('actionGutterRight');
-
-    const gutterCenter = document.getElementById('gutterCenter');
-    const resultTextarea = document.getElementById('resultTextarea');
-
     const statusBadge = document.getElementById('statusBadge');
-    const conflictCountText = document.getElementById('conflictCountText');
-    const conflictCountIcon = document.getElementById('conflictCountIcon');
-
-    // Buttons
+    const banner = document.getElementById('banner');
     const btnLayout3Col = document.getElementById('btnLayout3Col');
     const btnLayout2Row = document.getElementById('btnLayout2Row');
     const btnToggleSyncScroll = document.getElementById('btnToggleSyncScroll');
-    const btnMagicWand = document.getElementById('btnMagicWand');
-    const btnAcceptAllLeft = document.getElementById('btnAcceptAllLeft');
-    const btnAcceptAllRight = document.getElementById('btnAcceptAllRight');
-    const btnPrevConflict = document.getElementById('btnPrevConflict');
-    const btnNextConflict = document.getElementById('btnNextConflict');
-    const btnSaveStage = document.getElementById('btnSaveStage');
+    let rowH = 20;
+    let isSyncing = false;
 
-    // Initialize UI
-    function init() {
-      resultTextarea.value = state.resultContent;
-      renderPanes();
-      updateConflictCount();
-      setupScrollSync();
-      setupEvents();
-    }
-
-    function renderPanes() {
-      renderLeftPane();
-      renderRightPane();
-      renderCenterGutter();
+    function chunkById(id) {
+      return state.chunks.find(function (chunk) { return chunk.id === id; });
     }
 
     function escapeHtml(text) {
-      return text
+      return String(text)
         .replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;')
-        .replace(/'/g, '&#039;');
+        .replace(/"/g, '&quot;');
     }
 
-    function renderLeftPane() {
-      const lines = state.leftContent.split('\\n');
-      let gutterHtml = '';
-      let codeHtml = '';
-      let actionHtml = '';
+    function isSentinelLine(line) {
+      return /^<<<<<<< WMERGE \\S+ >>>>>>>$/.test(line);
+    }
 
-      lines.forEach((line, idx) => {
-        const lineNum = idx + 1;
-        gutterHtml += '<div class="line-number">' + lineNum + '</div>';
+    function splitContent(text) {
+      if (!text) return [];
+      return String(text).split('\\n');
+    }
 
-        // Check if line belongs to any conflict/diff chunk
-        const chunk = state.chunks.find(c => lineNum >= c.leftStartLine && lineNum <= c.leftEndLine);
-        let highlightClass = '';
-        if (chunk) {
-          highlightClass = chunk.type === 'conflict' ? 'conflict-highlight' : 'left-diff-highlight';
-        }
+    function linesOf(block) {
+      if (block.kind === 'context') return block.lines;
+      const chunk = chunkById(block.chunkId);
+      return chunk ? chunk.resultLines : [];
+    }
 
-        codeHtml += '<div class="code-line ' + highlightClass + '" id="left-line-' + lineNum + '">' + escapeHtml(line || ' ') + '</div>';
+    function displayRows(block) {
+      if (block.kind === 'context') return Math.max(block.lines.length, 1);
+      const chunk = chunkById(block.chunkId);
+      if (!chunk) return 1;
+      return Math.max(
+        splitContent(chunk.leftContent).length,
+        splitContent(chunk.rightContent).length,
+        chunk.resultLines.length,
+        1
+      );
+    }
 
-        // Add action button on the first line of the chunk
-        if (chunk && lineNum === chunk.leftStartLine) {
-          actionHtml += '<div class="action-btn-slot"><div class="apply-btn apply-left" title="Accept Left into Result" onclick="resolveChunk(\\'' + chunk.id + '\\', \\'left\\')">»</div><div class="apply-btn ignore-btn" title="Ignore change" onclick="resolveChunk(\\'' + chunk.id + '\\', \\'ignore\\')">✕</div></div>';
-        } else {
-          actionHtml += '<div class="action-btn-slot"></div>';
-        }
+    function blockPixelHeight(block) {
+      const action = block.kind === 'hunk' ? ACTION : 0;
+      return action + displayRows(block) * rowH;
+    }
+
+    function collectLines() {
+      const lines = [];
+      state.blocks.forEach(function (block) {
+        lines.push.apply(lines, linesOf(block));
       });
-
-      gutterLeft.innerHTML = gutterHtml;
-      codeLeft.innerHTML = codeHtml;
-      actionGutterLeft.innerHTML = actionHtml;
+      return lines;
     }
 
-    function renderRightPane() {
-      const lines = state.rightContent.split('\\n');
-      let gutterHtml = '';
-      let codeHtml = '';
-      let actionHtml = '';
-
-      lines.forEach((line, idx) => {
-        const lineNum = idx + 1;
-        gutterHtml += '<div class="line-number">' + lineNum + '</div>';
-
-        const chunk = state.chunks.find(c => lineNum >= c.rightStartLine && lineNum <= c.rightEndLine);
-        let highlightClass = '';
-        if (chunk) {
-          highlightClass = chunk.type === 'conflict' ? 'conflict-highlight' : 'right-diff-highlight';
-        }
-
-        codeHtml += '<div class="code-line ' + highlightClass + '" id="right-line-' + lineNum + '">' + escapeHtml(line || ' ') + '</div>';
-
-        if (chunk && lineNum === chunk.rightStartLine) {
-          actionHtml += '<div class="action-btn-slot"><div class="apply-btn ignore-btn" title="Ignore change" onclick="resolveChunk(\\'' + chunk.id + '\\', \\'ignore\\')">✕</div><div class="apply-btn apply-right" title="Accept Right into Result" onclick="resolveChunk(\\'' + chunk.id + '\\', \\'right\\')">«</div></div>';
-        } else {
-          actionHtml += '<div class="action-btn-slot"></div>';
-        }
+    function hasGitMarkers(lines) {
+      let start = false;
+      let middle = false;
+      let end = false;
+      lines.forEach(function (line) {
+        if (isSentinelLine(line)) return;
+        if (/^<{7} /.test(line)) start = true;
+        else if (/^={7}$/.test(line)) middle = true;
+        else if (/^>{7} /.test(line)) end = true;
       });
-
-      gutterRight.innerHTML = gutterHtml;
-      codeRight.innerHTML = codeHtml;
-      actionGutterRight.innerHTML = actionHtml;
+      return start && middle && end;
     }
 
-    function renderCenterGutter() {
-      const lines = resultTextarea.value.split('\\n');
-      let gutterHtml = '';
-      for (let i = 1; i <= lines.length; i++) {
-        gutterHtml += '<div class="line-number">' + i + '</div>';
-      }
-      gutterCenter.innerHTML = gutterHtml;
+    function unresolvedIds() {
+      return state.chunks.filter(function (chunk) {
+        return chunk.type === 'conflict' && chunk.resultLines.some(isSentinelLine);
+      }).map(function (chunk) { return chunk.id; });
     }
 
-    // Resolve an individual chunk
-    window.resolveChunk = function(chunkId, choice) {
-      const chunk = state.chunks.find(c => c.id === chunkId);
-      if (!chunk) return;
-
-      chunk.resolved = true;
-      chunk.chosen = choice;
-
-      let chosenText = '';
-      if (choice === 'left') {
-        chosenText = chunk.leftContent;
-      } else if (choice === 'right') {
-        chosenText = chunk.rightContent;
-      } else if (choice === 'both') {
-        chosenText = (chunk.leftContent ? chunk.leftContent + '\\n' : '') + chunk.rightContent;
-      } else if (choice === 'ignore') {
-        chosenText = chunk.baseContent || '';
-      }
-
-      // Replace conflict block in Result Textarea
-      let currentResult = resultTextarea.value;
-      const markerPattern = new RegExp('\\\\/\\\\* CONFLICT #' + chunk.id.replace('chunk-', '') + ':[^\\\\*]+\\\\*\\\\/', 'g');
-
-      if (markerPattern.test(currentResult)) {
-        currentResult = currentResult.replace(markerPattern, chosenText);
-      } else if (chunk.leftContent && currentResult.includes(chunk.leftContent)) {
-        currentResult = currentResult.replace(chunk.leftContent, chosenText);
-      } else if (chunk.rightContent && currentResult.includes(chunk.rightContent)) {
-        currentResult = currentResult.replace(chunk.rightContent, chosenText);
+    function updateConflictCount() {
+      const open = unresolvedIds();
+      const git = hasGitMarkers(collectLines());
+      if (open.length === 0 && !git) {
+        statusBadge.className = 'status-badge all-resolved';
+        statusBadge.textContent = 'All conflicts resolved';
+        document.getElementById('btnSaveStage').textContent = 'Apply and stage';
+      } else if (open.length > 0) {
+        statusBadge.className = 'status-badge has-conflicts';
+        statusBadge.textContent = open.length + ' unresolved';
+        document.getElementById('btnSaveStage').textContent = 'Apply and stage (' + open.length + ' left)';
       } else {
-        // Fallback: append or notification
-        currentResult = currentResult + '\\n' + chosenText;
+        statusBadge.className = 'status-badge has-conflicts';
+        statusBadge.textContent = 'Git conflict markers remain';
+        document.getElementById('btnSaveStage').textContent = 'Apply and stage';
       }
+    }
 
-      resultTextarea.value = currentResult;
-      renderCenterGutter();
+    function sideLines(chunk, side) {
+      if (side === 'left') return splitContent(chunk.leftContent);
+      if (side === 'right') return splitContent(chunk.rightContent);
+      return splitContent(chunk.baseContent);
+    }
+
+    function renderLines(lines, rows, emptyLabel) {
+      let html = '';
+      const count = Math.max(rows, 1);
+      for (let i = 0; i < count; i++) {
+        if (i < lines.length) {
+          html += '<div class="code-line">' + escapeHtml(lines[i].length ? lines[i] : ' ') + '</div>';
+        } else if (i === 0 && lines.length === 0) {
+          html += '<div class="code-line pad">' + escapeHtml(emptyLabel) + '</div>';
+        } else {
+          html += '<div class="code-line pad"></div>';
+        }
+      }
+      return html;
+    }
+
+    function hunkClass(chunk) {
+      return 'block hunk ' + (chunk ? chunk.type : 'conflict') + (chunk && state.currentId === chunk.id ? ' active' : '');
+    }
+
+    function renderSide(side) {
+      return state.blocks.map(function (block, index) {
+        const height = blockPixelHeight(block);
+        if (block.kind === 'context') {
+          return '<div class="block" data-block="' + index + '" style="height:' + height + 'px">' +
+            renderLines(block.lines, displayRows(block), '') + '</div>';
+        }
+        const chunk = chunkById(block.chunkId);
+        const lines = chunk ? sideLines(chunk, side) : [];
+        const label = side === 'left' ? 'Ours' : 'Theirs';
+        const act = side === 'left' ? 'left' : 'right';
+        return '<div class="' + hunkClass(chunk) + '" data-block="' + index + '" data-chunk="' + (chunk ? chunk.id : '') + '" style="height:' + height + 'px">' +
+          '<div class="hunk-actions"><button type="button" class="btn" data-act="' + act + '" data-id="' + (chunk ? chunk.id : '') + '">' + label + '</button></div>' +
+          renderLines(lines, displayRows(block), 'no lines') + '</div>';
+      }).join('');
+    }
+
+    function renderCenter() {
+      return state.blocks.map(function (block, index) {
+        const height = blockPixelHeight(block);
+        const textHeight = height - (block.kind === 'hunk' ? ACTION : 0);
+        if (block.kind === 'context') {
+          return '<div class="block" data-block="' + index + '" style="height:' + height + 'px">' +
+            '<textarea class="result-area" data-block="' + index + '" spellcheck="false" style="height:' + textHeight + 'px">' +
+            escapeHtml(block.lines.join('\\n')) + '</textarea></div>';
+        }
+        const chunk = chunkById(block.chunkId);
+        if (!chunk) {
+          return '<div class="block" data-block="' + index + '" style="height:' + height + 'px"></div>';
+        }
+        const value = chunk.resultLines.join('\\n');
+        return '<div class="' + hunkClass(chunk) + '" data-block="' + index + '" data-chunk="' + chunk.id + '" style="height:' + height + 'px">' +
+          '<div class="hunk-actions">' +
+          '<button type="button" class="btn" data-act="both" data-id="' + chunk.id + '">Both</button>' +
+          '<button type="button" class="btn" data-act="base" data-id="' + chunk.id + '">Base</button>' +
+          '</div>' +
+          '<textarea class="result-area" data-block="' + index + '" spellcheck="false" style="height:' + textHeight + 'px">' +
+          escapeHtml(value) + '</textarea></div>';
+      }).join('');
+    }
+
+    function render() {
+      const tops = [scrollLeft.scrollTop, scrollCenter.scrollTop, scrollRight.scrollTop];
+      scrollLeft.innerHTML = renderSide('left');
+      scrollRight.innerHTML = renderSide('right');
+      scrollCenter.innerHTML = renderCenter();
+      scrollLeft.scrollTop = tops[0];
+      scrollCenter.scrollTop = tops[1];
+      scrollRight.scrollTop = tops[2];
       updateConflictCount();
-    };
+    }
 
-    // Magic Wand: Automatically resolve non-conflicting chunks
-    function runMagicWand() {
-      let resolvedCount = 0;
-      state.chunks.forEach(chunk => {
-        if (!chunk.resolved) {
-          if (chunk.type === 'diff-left') {
-            resolveChunk(chunk.id, 'left');
-            resolvedCount++;
-          } else if (chunk.type === 'diff-right') {
-            resolveChunk(chunk.id, 'right');
-            resolvedCount++;
-          }
+    function textareaToLines(value) {
+      if (value === '') return [];
+      return value.split('\\n');
+    }
+
+    function resizeBlock(index) {
+      const block = state.blocks[index];
+      if (!block) return;
+      const height = blockPixelHeight(block);
+      document.querySelectorAll('[data-block="' + index + '"]').forEach(function (el) {
+        el.style.height = height + 'px';
+      });
+      const area = scrollCenter.querySelector('textarea[data-block="' + index + '"]');
+      if (area) {
+        const action = block.kind === 'hunk' ? ACTION : 0;
+        area.style.height = (height - action) + 'px';
+      }
+    }
+
+    function resolveChunk(id, choice) {
+      const chunk = chunkById(id);
+      if (!chunk || !choice) return;
+      if (choice === 'left') chunk.resultLines = splitContent(chunk.leftContent);
+      else if (choice === 'right') chunk.resultLines = splitContent(chunk.rightContent);
+      else if (choice === 'both') chunk.resultLines = splitContent(chunk.leftContent).concat(splitContent(chunk.rightContent));
+      else if (choice === 'base') chunk.resultLines = splitContent(chunk.baseContent);
+      else return;
+      chunk.resolved = !chunk.resultLines.some(isSentinelLine);
+      chunk.chosen = choice;
+      state.currentId = id;
+      render();
+    }
+
+    function applyNonConflicts() {
+      let count = 0;
+      state.chunks.forEach(function (chunk) {
+        if (chunk.type === 'diff-left') {
+          chunk.resultLines = splitContent(chunk.leftContent);
+          chunk.resolved = true;
+          chunk.chosen = 'left';
+          count++;
+        } else if (chunk.type === 'diff-right') {
+          chunk.resultLines = splitContent(chunk.rightContent);
+          chunk.resolved = true;
+          chunk.chosen = 'right';
+          count++;
         }
       });
+      render();
       vscode.postMessage({
         command: 'info',
-        text: 'Magic Wand applied! ' + resolvedCount + ' non-conflicting change(s) resolved automatically.'
+        text: 'Applied ' + count + ' non-conflicting change(s). ' + unresolvedIds().length + ' conflict(s) still need a choice.'
       });
     }
 
     function acceptAll(side) {
-      state.chunks.forEach(chunk => {
-        resolveChunk(chunk.id, side);
+      state.chunks.forEach(function (chunk) {
+        chunk.resultLines = splitContent(side === 'left' ? chunk.leftContent : chunk.rightContent);
+        chunk.resolved = !chunk.resultLines.some(isSentinelLine);
+        chunk.chosen = side;
       });
+      render();
+    }
+
+    function jump(delta) {
+      const ids = unresolvedIds();
+      if (ids.length === 0) return;
+      let index = ids.indexOf(state.currentId);
+      if (index < 0) index = delta > 0 ? -1 : 0;
+      index = (index + delta + ids.length) % ids.length;
+      state.currentId = ids[index];
+      const el = scrollLeft.querySelector('[data-chunk="' + state.currentId + '"]');
+      if (!el) return;
+      isSyncing = true;
+      scrollLeft.scrollTop = el.offsetTop;
+      scrollCenter.scrollTop = el.offsetTop;
+      scrollRight.scrollTop = el.offsetTop;
+      setTimeout(function () { isSyncing = false; }, 30);
+      render();
+    }
+
+    function save() {
       vscode.postMessage({
-        command: 'info',
-        text: 'Accepted all changes from ' + (side === 'left' ? 'Left (Ours)' : 'Right (Theirs)')
+        command: 'saveAndStage',
+        blocks: state.blocks,
+        chunks: state.chunks.map(function (chunk) {
+          return { id: chunk.id, resultLines: chunk.resultLines };
+        })
       });
     }
 
-    function updateConflictCount() {
-      // Count remaining conflicts from markers or unresolved chunk objects
-      const markerMatches = (resultTextarea.value.match(/\\/\\* CONFLICT #\\d+/g) || []).length;
-      const markerGitMatches = (resultTextarea.value.match(/<<<<<<<|=======|>>>>>>>/g) || []).length;
-      const unresolvedChunks = state.chunks.filter(c => c.type === 'conflict' && !c.resolved).length;
-      
-      const count = Math.max(markerMatches, unresolvedChunks);
-
-      if (count === 0 && markerGitMatches === 0) {
-        statusBadge.className = 'status-badge all-resolved';
-        conflictCountIcon.textContent = '✔';
-        conflictCountText.textContent = 'All conflicts resolved!';
-      } else {
-        statusBadge.className = 'status-badge has-conflicts';
-        conflictCountIcon.textContent = '⚡';
-        conflictCountText.textContent = count + ' conflict' + (count > 1 ? 's' : '') + ' remaining';
-      }
-    }
-
-    // Scroll Synchronization
-    let isSyncing = false;
-    function setupScrollSync() {
-      const sync = (source, targets) => {
+    function bindScroll(source, targets) {
+      source.addEventListener('scroll', function () {
         if (!state.syncScroll || isSyncing) return;
         isSyncing = true;
-        const ratio = source.scrollTop / (source.scrollHeight - source.clientHeight || 1);
-        targets.forEach(target => {
-          if (target) {
-            target.scrollTop = ratio * (target.scrollHeight - target.clientHeight);
-          }
-        });
-        setTimeout(() => { isSyncing = false; }, 20);
-      };
-
-      scrollLeft.addEventListener('scroll', () => sync(scrollLeft, [scrollCenter, scrollRight]));
-      scrollRight.addEventListener('scroll', () => sync(scrollRight, [scrollLeft, scrollCenter]));
-      resultTextarea.addEventListener('scroll', () => {
-        gutterCenter.scrollTop = resultTextarea.scrollTop;
-        sync(resultTextarea, [scrollLeft, scrollRight]);
+        targets.forEach(function (target) { target.scrollTop = source.scrollTop; });
+        setTimeout(function () { isSyncing = false; }, 20);
       });
     }
 
-    // Conflict Navigation
-    function scrollToConflict(index) {
-      if (state.chunks.length === 0) return;
-      if (index < 0) index = state.chunks.length - 1;
-      if (index >= state.chunks.length) index = 0;
-      state.currentConflictIndex = index;
+    function init() {
+      const probe = document.getElementById('lineProbe');
+      const measured = probe.getBoundingClientRect().height;
+      if (measured > 0) {
+        rowH = measured;
+        document.documentElement.style.setProperty('--row-h', rowH + 'px');
+      }
+      if (rawData.parseError) {
+        banner.hidden = false;
+        banner.textContent = rawData.parseError;
+      } else if (rawData.manualResolution) {
+        banner.hidden = false;
+        banner.textContent = 'The working tree has edits without conflict markers. Saving asks before overwrite.';
+      }
+      render();
+      bindScroll(scrollLeft, [scrollCenter, scrollRight]);
+      bindScroll(scrollRight, [scrollLeft, scrollCenter]);
+      bindScroll(scrollCenter, [scrollLeft, scrollRight]);
 
-      const chunk = state.chunks[index];
-      if (chunk) {
-        const leftEl = document.getElementById('left-line-' + chunk.leftStartLine);
-        if (leftEl) {
-          leftEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      document.body.addEventListener('click', function (event) {
+        const target = event.target;
+        if (!target || !target.closest) return;
+        const button = target.closest('[data-act]');
+        if (!button) return;
+        resolveChunk(button.getAttribute('data-id'), button.getAttribute('data-act'));
+      });
+
+      scrollCenter.addEventListener('input', function (event) {
+        const area = event.target;
+        if (!area || !area.classList || !area.classList.contains('result-area')) return;
+        const index = Number(area.getAttribute('data-block'));
+        const block = state.blocks[index];
+        if (!block) return;
+        const nextLines = textareaToLines(area.value);
+        if (block.kind === 'context') {
+          block.lines = nextLines;
+        } else {
+          const chunk = chunkById(block.chunkId);
+          if (!chunk) return;
+          chunk.resultLines = nextLines;
+          chunk.resolved = !nextLines.some(isSentinelLine);
+          if (chunk.resolved) chunk.chosen = 'custom';
+          else chunk.chosen = 'none';
         }
-      }
-    }
-
-    // Switch Layout: 3-Col vs 2-Row Split
-    function setLayout(layout) {
-      state.layout = layout;
-      if (layout === '3col') {
-        mergeBody.className = 'merge-body layout-3col';
-        btnLayout3Col.classList.add('active');
-        btnLayout2Row.classList.remove('active');
-        // Restore standard structure if needed
-        mergeBody.innerHTML = '';
-        mergeBody.appendChild(document.getElementById('paneLeft'));
-        mergeBody.appendChild(document.getElementById('paneCenter'));
-        mergeBody.appendChild(document.getElementById('paneRight'));
-      } else {
-        mergeBody.className = 'merge-body layout-2row';
-        btnLayout2Row.classList.add('active');
-        btnLayout3Col.classList.remove('active');
-        // Create 2-row layout wrapper
-        mergeBody.innerHTML = '<div class="top-row" id="topRow"></div><div class="bottom-row" id="bottomRow"></div>';
-        const topRow = document.getElementById('topRow');
-        const bottomRow = document.getElementById('bottomRow');
-        topRow.appendChild(document.getElementById('paneLeft'));
-        topRow.appendChild(document.getElementById('paneRight'));
-        bottomRow.appendChild(document.getElementById('paneCenter'));
-      }
-    }
-
-    function setupEvents() {
-      resultTextarea.addEventListener('input', () => {
-        renderCenterGutter();
+        resizeBlock(index);
         updateConflictCount();
       });
 
-      btnLayout3Col.addEventListener('click', () => setLayout('3col'));
-      btnLayout2Row.addEventListener('click', () => setLayout('2row'));
-
-      btnToggleSyncScroll.addEventListener('click', () => {
+      btnLayout3Col.addEventListener('click', function () {
+        mergeBody.className = 'merge-body layout-3col';
+        btnLayout3Col.classList.add('active');
+        btnLayout2Row.classList.remove('active');
+      });
+      btnLayout2Row.addEventListener('click', function () {
+        mergeBody.className = 'merge-body layout-2row';
+        btnLayout2Row.classList.add('active');
+        btnLayout3Col.classList.remove('active');
+      });
+      btnToggleSyncScroll.addEventListener('click', function () {
         state.syncScroll = !state.syncScroll;
         btnToggleSyncScroll.classList.toggle('active', state.syncScroll);
       });
+      document.getElementById('btnMagicWand').addEventListener('click', applyNonConflicts);
+      document.getElementById('btnAcceptAllLeft').addEventListener('click', function () { acceptAll('left'); });
+      document.getElementById('btnAcceptAllRight').addEventListener('click', function () { acceptAll('right'); });
+      document.getElementById('btnPrevConflict').addEventListener('click', function () { jump(-1); });
+      document.getElementById('btnNextConflict').addEventListener('click', function () { jump(1); });
+      document.getElementById('btnSaveStage').addEventListener('click', save);
 
-      btnMagicWand.addEventListener('click', runMagicWand);
-      btnAcceptAllLeft.addEventListener('click', () => acceptAll('left'));
-      btnAcceptAllRight.addEventListener('click', () => acceptAll('right'));
-
-      btnPrevConflict.addEventListener('click', () => scrollToConflict(state.currentConflictIndex - 1));
-      btnNextConflict.addEventListener('click', () => scrollToConflict(state.currentConflictIndex + 1));
-
-      btnSaveStage.addEventListener('click', () => {
-        vscode.postMessage({
-          command: 'saveAndStage',
-          content: resultTextarea.value
-        });
-      });
-
-      // Keyboard shortcuts
-      window.addEventListener('keydown', (e) => {
-        if ((e.ctrlKey || e.metaKey) && e.key === 's') {
-          e.preventDefault();
-          btnSaveStage.click();
-        } else if (e.key === 'F7') {
-          e.preventDefault();
-          if (e.shiftKey) {
-            scrollToConflict(state.currentConflictIndex - 1);
-          } else {
-            scrollToConflict(state.currentConflictIndex + 1);
-          }
-        } else if (e.altKey && e.key === 'ArrowDown') {
-          e.preventDefault();
-          scrollToConflict(state.currentConflictIndex + 1);
-        } else if (e.altKey && e.key === 'ArrowUp') {
-          e.preventDefault();
-          scrollToConflict(state.currentConflictIndex - 1);
+      window.addEventListener('keydown', function (event) {
+        if ((event.ctrlKey || event.metaKey) && event.key === 's') {
+          event.preventDefault();
+          save();
+          return;
+        }
+        if (event.key === 'Tab' && event.target && event.target.classList && event.target.classList.contains('result-area')) {
+          event.preventDefault();
+          const area = event.target;
+          const start = area.selectionStart;
+          const end = area.selectionEnd;
+          area.setRangeText('  ', start, end, 'end');
+          area.dispatchEvent(new Event('input', { bubbles: true }));
+          return;
+        }
+        if (event.key === 'F7') {
+          event.preventDefault();
+          jump(event.shiftKey ? -1 : 1);
+        } else if (event.altKey && event.key === 'ArrowDown') {
+          event.preventDefault();
+          jump(1);
+        } else if (event.altKey && event.key === 'ArrowUp') {
+          event.preventDefault();
+          jump(-1);
         }
       });
     }

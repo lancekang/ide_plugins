@@ -1,9 +1,16 @@
 import * as vscode from 'vscode';
 import { GitService } from './gitService.js';
 import { MergePanel } from './mergePanel.js';
+import { hasGitConflictMarkers } from './diffEngine.js';
+
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
 
 export function activate(context: vscode.ExtensionContext) {
-  // Command 1: Resolve current file or selected file
+  const configuredGit = vscode.workspace.getConfiguration('git').get<string>('path');
+  GitService.setGitExecutable(configuredGit);
+
   const resolveCurrentCmd = vscode.commands.registerCommand(
     'webstorm-merge.resolveCurrentFile',
     async (uri?: vscode.Uri) => {
@@ -16,21 +23,19 @@ export function activate(context: vscode.ExtensionContext) {
       }
 
       if (!targetPath) {
-        // Fallback to scanning repo for conflicts
-        vscode.commands.executeCommand('webstorm-merge.scanAndResolve');
+        await vscode.commands.executeCommand('webstorm-merge.scanAndResolve');
         return;
       }
 
       try {
         const mergeData = await GitService.loadMergeData(targetPath);
         MergePanel.createOrShow(context.extensionUri, mergeData);
-      } catch (err: any) {
-        vscode.window.showErrorMessage(`Failed to open WebStorm Merge GUI: ${err?.message || err}`);
+      } catch (err: unknown) {
+        vscode.window.showErrorMessage(`Failed to open WebStorm Merge GUI: ${errorText(err)}`);
       }
     }
   );
 
-  // Command 2: Scan for all conflicts in workspace and let user pick
   const scanAndResolveCmd = vscode.commands.registerCommand(
     'webstorm-merge.scanAndResolve',
     async () => {
@@ -40,26 +45,31 @@ export function activate(context: vscode.ExtensionContext) {
         return;
       }
 
-      let allConflicts: Array<{ fsPath: string; relPath: string; fileName: string; folder: string }> = [];
+      const allConflicts: Array<{ fsPath: string; relPath: string; fileName: string; folder: string }> = [];
 
-      for (const folder of folders) {
-        const gitRoot = await GitService.findGitRoot(folder.uri.fsPath);
-        if (gitRoot) {
-          const conflicts = await GitService.getConflictedFiles(gitRoot);
-          allConflicts.push(...conflicts.map(c => ({ ...c, folder: folder.name })));
+      try {
+        for (const folder of folders) {
+          const gitRoot = await GitService.findGitRoot(folder.uri.fsPath);
+          if (gitRoot) {
+            const conflicts = await GitService.getConflictedFiles(gitRoot);
+            allConflicts.push(...conflicts.map(item => ({ ...item, folder: folder.name })));
+          }
         }
-      }
-
-      if (allConflicts.length === 0) {
-        vscode.window.showInformationMessage('No Git merge conflicts found in workspace! 🎉');
+      } catch (err: unknown) {
+        vscode.window.showErrorMessage(`Failed to scan Git conflicts: ${errorText(err)}`);
         return;
       }
 
-      const items = allConflicts.map(c => ({
-        label: `$(git-merge) ${c.fileName}`,
-        description: c.relPath,
-        detail: `Folder: ${c.folder}`,
-        conflict: c
+      if (allConflicts.length === 0) {
+        vscode.window.showInformationMessage('No Git merge conflicts found in workspace.');
+        return;
+      }
+
+      const items = allConflicts.map(item => ({
+        label: `$(git-merge) ${item.fileName}`,
+        description: item.relPath,
+        detail: `Folder: ${item.folder}`,
+        conflict: item
       }));
 
       const selected = await vscode.window.showQuickPick(items, {
@@ -67,51 +77,76 @@ export function activate(context: vscode.ExtensionContext) {
         matchOnDescription: true
       });
 
-      if (selected) {
+      if (!selected) {
+        return;
+      }
+
+      try {
         const mergeData = await GitService.loadMergeData(selected.conflict.fsPath);
         MergePanel.createOrShow(context.extensionUri, mergeData);
+      } catch (err: unknown) {
+        vscode.window.showErrorMessage(`Failed to open WebStorm Merge GUI: ${errorText(err)}`);
       }
     }
   );
 
-  // Status bar button when conflict markers are detected in active editor
   const conflictStatusBarItem = vscode.window.createStatusBarItem(
     vscode.StatusBarAlignment.Right,
     100
   );
   conflictStatusBarItem.command = 'webstorm-merge.resolveCurrentFile';
 
-  const checkConflictInActiveEditor = (editor?: vscode.TextEditor) => {
-    if (!editor || editor.document.isUntitled) {
+  const applyConflictContext = async (editor?: vscode.TextEditor) => {
+    if (!editor || editor.document.isUntitled || editor.document.uri.scheme !== 'file') {
       conflictStatusBarItem.hide();
+      await vscode.commands.executeCommand('setContext', 'webstormMerge.fileHasConflict', false);
       return;
     }
 
     const text = editor.document.getText();
-    if (text.includes('<<<<<<<') && text.includes('>>>>>>>')) {
-      conflictStatusBarItem.text = `$(git-merge) WebStorm Merge (Conflicts Detected)`;
-      conflictStatusBarItem.tooltip = 'Click to open WebStorm style 3-way merge conflict resolver';
+    if (hasGitConflictMarkers(text)) {
+      conflictStatusBarItem.text = '$(git-merge) WebStorm Merge';
+      conflictStatusBarItem.tooltip = 'Open the 3-way merge view for this file';
       conflictStatusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
       conflictStatusBarItem.show();
+      await vscode.commands.executeCommand('setContext', 'webstormMerge.fileHasConflict', true);
     } else {
       conflictStatusBarItem.hide();
+      await vscode.commands.executeCommand('setContext', 'webstormMerge.fileHasConflict', false);
     }
+  };
+
+  let conflictCheckTimer: ReturnType<typeof setTimeout> | undefined;
+  const scheduleConflictCheck = (editor?: vscode.TextEditor) => {
+    if (conflictCheckTimer) {
+      clearTimeout(conflictCheckTimer);
+    }
+    conflictCheckTimer = setTimeout(() => {
+      void applyConflictContext(editor);
+    }, 200);
   };
 
   context.subscriptions.push(
     resolveCurrentCmd,
     scanAndResolveCmd,
     conflictStatusBarItem,
-    vscode.window.onDidChangeActiveTextEditor(checkConflictInActiveEditor),
-    vscode.workspace.onDidChangeTextDocument((e) => {
-      if (vscode.window.activeTextEditor && e.document === vscode.window.activeTextEditor.document) {
-        checkConflictInActiveEditor(vscode.window.activeTextEditor);
+    vscode.window.onDidChangeActiveTextEditor(editor => {
+      void applyConflictContext(editor);
+    }),
+    vscode.workspace.onDidChangeTextDocument(event => {
+      const active = vscode.window.activeTextEditor;
+      if (active && event.document === active.document) {
+        scheduleConflictCheck(active);
+      }
+    }),
+    new vscode.Disposable(() => {
+      if (conflictCheckTimer) {
+        clearTimeout(conflictCheckTimer);
       }
     })
   );
 
-  // Initial check
-  checkConflictInActiveEditor(vscode.window.activeTextEditor);
+  void applyConflictContext(vscode.window.activeTextEditor);
 }
 
 export function deactivate() {}

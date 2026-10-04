@@ -1,6 +1,8 @@
 .vscode/**
 .vscode-test/**
 src/**
+test/**
+preview.html
 tsconfig.json
 *.vsix
 .git/**

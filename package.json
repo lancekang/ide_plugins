@@ -50,19 +50,21 @@
         {
           "command": "webstorm-merge.resolveCurrentFile",
           "group": "navigation",
-          "when": "resourceScheme == file"
+          "when": "resourceScheme == file && webstormMerge.fileHasConflict"
         }
       ],
       "scm/resourceGroup/context": [
         {
           "command": "webstorm-merge.resolveCurrentFile",
-          "group": "inline"
+          "group": "inline",
+          "when": "scmResourceGroup == merge"
         }
       ],
       "scm/resourceState/context": [
         {
           "command": "webstorm-merge.resolveCurrentFile",
-          "group": "inline"
+          "group": "inline",
+          "when": "scmResourceGroup == merge"
         }
       ],
       "explorer/context": [
@@ -76,7 +78,8 @@
       {
         "command": "webstorm-merge.resolveCurrentFile",
         "key": "ctrl+alt+m",
-        "mac": "cmd+alt+m"
+        "mac": "cmd+alt+m",
+        "when": "webstormMerge.fileHasConflict"
       }
     ]
   },
