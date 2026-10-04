@@ -1,0 +1,99 @@
+{
+  "name": "webstorm-merge-gui",
+  "displayName": "WebStorm Merge GUI (3-Way Conflict Resolver)",
+  "description": "IntelliJ / WebStorm style 3-way Git merge conflict resolver for VS Code and Cursor.",
+  "version": "1.0.0",
+  "publisher": "antigravity",
+  "icon": "media/icon.png",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/developer/webstorm-merge-gui"
+  },
+  "license": "MIT",
+  "categories": [
+    "SCM Providers",
+    "Other"
+  ],
+  "keywords": [
+    "git",
+    "merge",
+    "conflict",
+    "webstorm",
+    "intellij",
+    "3-way merge",
+    "diff"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "webstorm-merge.resolveCurrentFile",
+        "title": "Resolve with WebStorm Merge GUI",
+        "icon": "$(git-merge)",
+        "category": "Git Conflict"
+      },
+      {
+        "command": "webstorm-merge.scanAndResolve",
+        "title": "WebStorm Merge: Find Conflicted Files",
+        "icon": "$(git-pull-request-go-to-changes)",
+        "category": "Git Conflict"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "webstorm-merge.resolveCurrentFile",
+          "group": "navigation",
+          "when": "resourceScheme == file"
+        }
+      ],
+      "scm/resourceGroup/context": [
+        {
+          "command": "webstorm-merge.resolveCurrentFile",
+          "group": "inline"
+        }
+      ],
+      "scm/resourceState/context": [
+        {
+          "command": "webstorm-merge.resolveCurrentFile",
+          "group": "inline"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "webstorm-merge.resolveCurrentFile",
+          "group": "7_modification"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "webstorm-merge.resolveCurrentFile",
+        "key": "ctrl+alt+m",
+        "mac": "cmd+alt+m"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run build",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "build": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node",
+    "test": "npx esbuild test/testDiffEngine.ts --bundle --platform=node | node",
+    "package": "npm run build && npx -y @vscode/vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/diff": "^7.0.2",
+    "@types/node": "^20.19.43",
+    "@types/vscode": "^1.90.0",
+    "diff": "^9.0.0",
+    "esbuild": "^0.20.2",
+    "typescript": "^5.9.3"
+  }
+}

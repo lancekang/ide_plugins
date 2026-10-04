@@ -1,0 +1,956 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WebStorm Merge GUI - Live Interactive Preview</title>
+  <style>
+    :root {
+      --bg: #1e1e1e;
+      --fg: #d4d4d4;
+      --border-color: #333333;
+      --header-bg: #252526;
+      --toolbar-bg: #1e1e20;
+      --button-bg: #0e639c;
+      --button-fg: #ffffff;
+      --button-hover: #1177bb;
+      --secondary-btn-bg: #3a3d41;
+      --secondary-btn-fg: #ffffff;
+      --secondary-btn-hover: #45494e;
+      --accent-green: #388e3c;
+      --accent-blue: #1976d2;
+      --accent-red: #d32f2f;
+      --accent-orange: #f57c00;
+      --conflict-bg: rgba(239, 83, 80, 0.18);
+      --conflict-border: #ef5350;
+      --left-diff-bg: rgba(67, 160, 71, 0.15);
+      --left-border: #43a047;
+      --right-diff-bg: rgba(33, 150, 243, 0.15);
+      --right-border: #2196f3;
+      --font-code: 'Consolas', 'Courier New', monospace;
+      --font-size: 13px;
+      --line-height: 22px;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      background-color: var(--bg);
+      color: var(--fg);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+      font-size: 13px;
+      height: 100vh;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* TOP TOOLBAR - WebStorm Style */
+    .toolbar {
+      background: var(--toolbar-bg);
+      border-bottom: 1px solid var(--border-color);
+      padding: 8px 14px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      user-select: none;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.25);
+      z-index: 100;
+      flex-wrap: wrap;
+    }
+
+    .toolbar-left, .toolbar-center, .toolbar-right {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .file-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-weight: 600;
+      font-size: 13px;
+      color: #fff;
+      background: rgba(255, 255, 255, 0.07);
+      padding: 5px 12px;
+      border-radius: 4px;
+      border: 1px solid var(--border-color);
+    }
+
+    .status-badge {
+      padding: 4px 10px;
+      border-radius: 12px;
+      font-size: 11px;
+      font-weight: 700;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+    }
+
+    .status-badge.has-conflicts {
+      background: var(--accent-orange);
+      color: #fff;
+    }
+
+    .status-badge.all-resolved {
+      background: var(--accent-green);
+      color: #fff;
+    }
+
+    .btn {
+      background: var(--secondary-btn-bg);
+      color: var(--secondary-btn-fg);
+      border: 1px solid rgba(255,255,255,0.08);
+      padding: 6px 12px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 12px;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-weight: 500;
+      transition: all 0.15s ease;
+      white-space: nowrap;
+    }
+
+    .btn:hover {
+      background: var(--secondary-btn-hover);
+    }
+
+    .btn-primary {
+      background: var(--button-bg);
+      color: var(--button-fg);
+      font-weight: 600;
+    }
+
+    .btn-primary:hover {
+      background: var(--button-hover);
+    }
+
+    .btn-success {
+      background: #2e7d32;
+      color: #ffffff;
+      font-weight: 600;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+    }
+
+    .btn-success:hover {
+      background: #388e3c;
+    }
+
+    .btn-magic {
+      background: linear-gradient(135deg, #7b1fa2, #512da8);
+      color: #ffffff;
+      font-weight: 600;
+      border: 1px solid #ba68c8;
+      box-shadow: 0 2px 6px rgba(123, 31, 162, 0.4);
+    }
+
+    .btn-magic:hover {
+      background: linear-gradient(135deg, #8e24aa, #5e35b1);
+    }
+
+    .toggle-group {
+      display: inline-flex;
+      border: 1px solid var(--border-color);
+      border-radius: 4px;
+      overflow: hidden;
+    }
+
+    .toggle-group .btn {
+      border: none;
+      border-radius: 0;
+      padding: 6px 10px;
+    }
+
+    .toggle-group .btn.active {
+      background: var(--button-bg);
+      color: #fff;
+    }
+
+    /* MAIN EDITORS CONTAINER */
+    .merge-body {
+      flex: 1;
+      display: flex;
+      overflow: hidden;
+      position: relative;
+    }
+
+    /* 3-Column Layout */
+    .merge-body.layout-3col {
+      flex-direction: row;
+    }
+
+    .merge-body.layout-3col .pane-left {
+      width: 32%;
+      border-right: 1px solid var(--border-color);
+    }
+
+    .merge-body.layout-3col .pane-center {
+      width: 36%;
+      border-right: 1px solid var(--border-color);
+    }
+
+    .merge-body.layout-3col .pane-right {
+      width: 32%;
+    }
+
+    /* 2-Row Split Layout */
+    .merge-body.layout-2row {
+      flex-direction: column;
+    }
+
+    .merge-body.layout-2row .top-row {
+      display: flex;
+      flex-direction: row;
+      height: 48%;
+      border-bottom: 2px solid var(--border-color);
+    }
+
+    .merge-body.layout-2row .top-row .pane-left {
+      width: 50%;
+      border-right: 1px solid var(--border-color);
+    }
+
+    .merge-body.layout-2row .top-row .pane-right {
+      width: 50%;
+    }
+
+    .merge-body.layout-2row .bottom-row {
+      height: 52%;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .merge-body.layout-2row .bottom-row .pane-center {
+      width: 100%;
+      height: 100%;
+    }
+
+    /* PANE COMMON */
+    .editor-pane {
+      display: flex;
+      flex-direction: column;
+      height: 100%;
+      background: var(--bg);
+      overflow: hidden;
+    }
+
+    .pane-header {
+      background: var(--header-bg);
+      border-bottom: 1px solid var(--border-color);
+      padding: 8px 12px;
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      user-select: none;
+    }
+
+    .pane-header .badge {
+      padding: 3px 8px;
+      border-radius: 4px;
+      font-size: 10px;
+      font-weight: bold;
+    }
+
+    .pane-left .badge {
+      background: var(--left-border);
+      color: #fff;
+    }
+
+    .pane-center .badge {
+      background: #0e639c;
+      color: #fff;
+    }
+
+    .pane-right .badge {
+      background: var(--right-border);
+      color: #fff;
+    }
+
+    /* EDITOR SCROLL AREA */
+    .pane-content {
+      flex: 1;
+      overflow: auto;
+      display: flex;
+      font-family: var(--font-code);
+      font-size: var(--font-size);
+      line-height: var(--line-height);
+      position: relative;
+    }
+
+    /* Gutter and Line Numbers */
+    .gutter {
+      user-select: none;
+      background: rgba(0, 0, 0, 0.2);
+      border-right: 1px solid var(--border-color);
+      padding: 8px 4px;
+      text-align: right;
+      color: #858585;
+      font-size: 11px;
+      min-width: 44px;
+    }
+
+    .line-number {
+      height: var(--line-height);
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      padding-right: 6px;
+    }
+
+    /* Action Gutter (WebStorm Arrow Buttons » « ✕) */
+    .action-gutter {
+      user-select: none;
+      width: 48px;
+      background: rgba(0, 0, 0, 0.12);
+      border-right: 1px solid var(--border-color);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding-top: 8px;
+    }
+
+    .action-btn-slot {
+      height: var(--line-height);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 100%;
+    }
+
+    .apply-btn {
+      width: 20px;
+      height: 18px;
+      line-height: 18px;
+      text-align: center;
+      border-radius: 3px;
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 800;
+      color: #fff;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: transform 0.1s, opacity 0.1s;
+    }
+
+    .apply-btn:hover {
+      transform: scale(1.18);
+    }
+
+    .apply-btn.apply-left {
+      background: var(--accent-green);
+    }
+
+    .apply-btn.apply-right {
+      background: var(--accent-blue);
+    }
+
+    .apply-btn.ignore-btn {
+      background: #757575;
+      font-size: 10px;
+      margin-left: 2px;
+    }
+
+    .apply-btn.ignore-btn:hover {
+      background: var(--accent-red);
+    }
+
+    /* Code View Area */
+    .code-view {
+      flex: 1;
+      padding: 8px 0;
+      white-space: pre;
+      overflow-x: auto;
+    }
+
+    .code-line {
+      height: var(--line-height);
+      padding: 0 10px;
+      display: flex;
+      align-items: center;
+    }
+
+    .code-line.conflict-highlight {
+      background-color: var(--conflict-bg);
+      border-left: 3px solid var(--conflict-border);
+    }
+
+    .code-line.left-diff-highlight {
+      background-color: var(--left-diff-bg);
+      border-left: 3px solid var(--left-border);
+    }
+
+    .code-line.right-diff-highlight {
+      background-color: var(--right-diff-bg);
+      border-left: 3px solid var(--right-border);
+    }
+
+    /* Editable Textarea in Center Pane */
+    .result-editor-wrapper {
+      flex: 1;
+      display: flex;
+      position: relative;
+    }
+
+    .result-textarea {
+      flex: 1;
+      background: transparent;
+      color: var(--fg);
+      font-family: var(--font-code);
+      font-size: var(--font-size);
+      line-height: var(--line-height);
+      padding: 8px 10px;
+      border: none;
+      outline: none;
+      resize: none;
+      white-space: pre;
+      overflow: auto;
+      tab-size: 2;
+    }
+
+    /* Keyboard help footer */
+    .status-bar {
+      background: var(--toolbar-bg);
+      border-top: 1px solid var(--border-color);
+      padding: 6px 14px;
+      font-size: 11px;
+      display: flex;
+      justify-content: space-between;
+      color: #999;
+      user-select: none;
+    }
+
+    .status-bar kbd {
+      background: rgba(255,255,255,0.12);
+      padding: 2px 6px;
+      border-radius: 3px;
+      border: 1px solid rgba(255,255,255,0.18);
+      color: #fff;
+      font-family: var(--font-code);
+    }
+
+    .toast-msg {
+      position: fixed;
+      bottom: 40px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: #2e7d32;
+      color: #fff;
+      padding: 8px 18px;
+      border-radius: 6px;
+      font-size: 13px;
+      font-weight: 600;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+      display: none;
+      z-index: 1000;
+      animation: fadeInOut 2.5s forwards;
+    }
+
+    @keyframes fadeInOut {
+      0% { opacity: 0; transform: translate(-50%, 10px); }
+      15% { opacity: 1; transform: translate(-50%, 0); }
+      85% { opacity: 1; transform: translate(-50%, 0); }
+      100% { opacity: 0; transform: translate(-50%, -10px); }
+    }
+  </style>
+</head>
+<body>
+
+  <div id="toast" class="toast-msg"></div>
+
+  <!-- TOP TOOLBAR -->
+  <div class="toolbar">
+    <div class="toolbar-left">
+      <div class="file-badge">
+        <span>📄</span>
+        <span>src/orderService.ts</span>
+      </div>
+      <div id="statusBadge" class="status-badge has-conflicts">
+        <span id="conflictCountIcon">⚡</span>
+        <span id="conflictCountText">2 conflicts remaining</span>
+      </div>
+      <div class="toggle-group" title="Navigate between conflict chunks">
+        <button id="btnPrevConflict" class="btn">▲ Prev</button>
+        <button id="btnNextConflict" class="btn">▼ Next</button>
+      </div>
+    </div>
+
+    <div class="toolbar-center">
+      <button id="btnMagicWand" class="btn btn-magic" title="WebStorm Magic Wand: Automatically accept all non-conflicting changes from both sides">
+        🪄 Magic Wand (Auto-Resolve)
+      </button>
+      <button id="btnAcceptAllLeft" class="btn" title="Accept all changes from Left (Ours)">
+        »» Accept All Left
+      </button>
+      <button id="btnAcceptAllRight" class="btn" title="Accept all changes from Right (Theirs)">
+        «« Accept All Right
+      </button>
+    </div>
+
+    <div class="toolbar-right">
+      <div class="toggle-group">
+        <button id="btnLayout3Col" class="btn active" title="WebStorm Classic 3-Column Layout">⬌ 3-Column</button>
+        <button id="btnLayout2Row" class="btn" title="2-Row Split Layout">⬍ 2-Row Split</button>
+      </div>
+      <button id="btnToggleSyncScroll" class="btn active" title="Toggle Synchronized Scrolling">
+        🔗 Sync Scroll
+      </button>
+      <button id="btnSaveStage" class="btn btn-success" title="Save file and stage with 'git add' (Ctrl+S)">
+        💾 Apply & Save (git add)
+      </button>
+    </div>
+  </div>
+
+  <!-- MAIN MERGE BODY -->
+  <div id="mergeBody" class="merge-body layout-3col">
+    <!-- LEFT PANE: OURS -->
+    <div class="editor-pane pane-left" id="paneLeft">
+      <div class="pane-header">
+        <span>Local: feature/tax-calculation (HEAD)</span>
+        <span class="badge">OURS (LOCAL)</span>
+      </div>
+      <div class="pane-content" id="scrollLeft">
+        <div class="gutter" id="gutterLeft"></div>
+        <div class="code-view" id="codeLeft"></div>
+        <div class="action-gutter" id="actionGutterLeft" title="Apply to Result"></div>
+      </div>
+    </div>
+
+    <!-- CENTER PANE: RESULT -->
+    <div class="editor-pane pane-center" id="paneCenter">
+      <div class="pane-header">
+        <span>Result (Merged Output)</span>
+        <span class="badge">EDITABLE</span>
+      </div>
+      <div class="pane-content" id="scrollCenter">
+        <div class="gutter" id="gutterCenter"></div>
+        <div class="result-editor-wrapper">
+          <textarea id="resultTextarea" class="result-textarea" spellcheck="false"></textarea>
+        </div>
+      </div>
+    </div>
+
+    <!-- RIGHT PANE: THEIRS -->
+    <div class="editor-pane pane-right" id="paneRight">
+      <div class="pane-header">
+        <span>Incoming: origin/main</span>
+        <span class="badge">THEIRS (INCOMING)</span>
+      </div>
+      <div class="pane-content" id="scrollRight">
+        <div class="action-gutter" id="actionGutterRight" title="Apply to Result"></div>
+        <div class="gutter" id="gutterRight"></div>
+        <div class="code-view" id="codeRight"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- STATUS FOOTER -->
+  <div class="status-bar">
+    <div>
+      Shortcuts: <kbd>F7</kbd> Next Conflict &nbsp;|&nbsp; <kbd>Shift+F7</kbd> Prev Conflict &nbsp;|&nbsp; <kbd>Ctrl+S</kbd> Save & git add
+    </div>
+    <div>
+      Source: Git 3-Way Index (:1: Base, :2: Ours, :3: Theirs)
+    </div>
+  </div>
+
+  <script>
+    const sampleData = {
+      chunks: [
+        {
+          id: 'chunk-1',
+          type: 'diff-left',
+          leftStartLine: 3,
+          leftEndLine: 5,
+          rightStartLine: 3,
+          rightEndLine: 3,
+          leftContent: '  // Updated tax policy 2026\n  const VAT_RATE = 0.10;\n  const SERVICE_FEE = 2.50;',
+          rightContent: '',
+          resolved: false,
+          chosen: 'none'
+        },
+        {
+          id: 'chunk-2',
+          type: 'conflict',
+          leftStartLine: 9,
+          leftEndLine: 13,
+          rightStartLine: 7,
+          rightEndLine: 11,
+          leftContent: '  public calculateTotal(order: Order): number {\n    const subtotal = order.items.reduce((s, i) => s + i.price * i.qty, 0);\n    return (subtotal + SERVICE_FEE) * (1 + VAT_RATE);\n  }',
+          rightContent: '  public calculateTotal(order: Order): number {\n    const subtotal = order.items.reduce((sum, item) => sum + item.unitPrice * item.quantity, 0);\n    const discount = order.coupon ? order.coupon.amount : 0;\n    return Math.max(0, subtotal - discount);\n  }',
+          resolved: false,
+          chosen: 'none'
+        },
+        {
+          id: 'chunk-3',
+          type: 'conflict',
+          leftStartLine: 17,
+          leftEndLine: 20,
+          rightStartLine: 15,
+          rightEndLine: 18,
+          leftContent: '  public formatCurrency(val: number): string {\n    return `₩${val.toLocaleString()}`;\n  }',
+          rightContent: '  public formatCurrency(val: number): string {\n    return Intl.NumberFormat(\'ko-KR\', { style: \'currency\', currency: \'KRW\' }).format(val);\n  }',
+          resolved: false,
+          chosen: 'none'
+        }
+      ],
+      leftContent: `import { Order, Item } from './models';
+
+  // Updated tax policy 2026
+  const VAT_RATE = 0.10;
+  const SERVICE_FEE = 2.50;
+
+export class OrderService {
+  public calculateTotal(order: Order): number {
+    const subtotal = order.items.reduce((s, i) => s + i.price * i.qty, 0);
+    return (subtotal + SERVICE_FEE) * (1 + VAT_RATE);
+  }
+
+  public validateOrder(order: Order): boolean {
+    return order.items.length > 0;
+  }
+
+  public formatCurrency(val: number): string {
+    return \`₩\${val.toLocaleString()}\`;
+  }
+}`,
+      rightContent: `import { Order, Item } from './models';
+
+export class OrderService {
+  public calculateTotal(order: Order): number {
+    const subtotal = order.items.reduce((sum, item) => sum + item.unitPrice * item.quantity, 0);
+    const discount = order.coupon ? order.coupon.amount : 0;
+    return Math.max(0, subtotal - discount);
+  }
+
+  public validateOrder(order: Order): boolean {
+    return order.items.length > 0;
+  }
+
+  public formatCurrency(val: number): string {
+    return Intl.NumberFormat('ko-KR', { style: 'currency', currency: 'KRW' }).format(val);
+  }
+}`,
+      initialResult: `import { Order, Item } from './models';
+
+/* CONFLICT #1: Choose Left (») or Right («) */
+
+export class OrderService {
+/* CONFLICT #2: Choose Left (») or Right («) */
+
+  public validateOrder(order: Order): boolean {
+    return order.items.length > 0;
+  }
+
+/* CONFLICT #3: Choose Left (») or Right («) */
+}`
+    };
+
+    let state = {
+      chunks: sampleData.chunks,
+      leftContent: sampleData.leftContent,
+      rightContent: sampleData.rightContent,
+      resultContent: sampleData.initialResult,
+      currentConflictIndex: 0,
+      syncScroll: true,
+      layout: '3col'
+    };
+
+    const mergeBody = document.getElementById('mergeBody');
+    const scrollLeft = document.getElementById('scrollLeft');
+    const scrollCenter = document.getElementById('scrollCenter');
+    const scrollRight = document.getElementById('scrollRight');
+
+    const gutterLeft = document.getElementById('gutterLeft');
+    const codeLeft = document.getElementById('codeLeft');
+    const actionGutterLeft = document.getElementById('actionGutterLeft');
+
+    const gutterRight = document.getElementById('gutterRight');
+    const codeRight = document.getElementById('codeRight');
+    const actionGutterRight = document.getElementById('actionGutterRight');
+
+    const gutterCenter = document.getElementById('gutterCenter');
+    const resultTextarea = document.getElementById('resultTextarea');
+
+    const statusBadge = document.getElementById('statusBadge');
+    const conflictCountText = document.getElementById('conflictCountText');
+    const conflictCountIcon = document.getElementById('conflictCountIcon');
+
+    const btnLayout3Col = document.getElementById('btnLayout3Col');
+    const btnLayout2Row = document.getElementById('btnLayout2Row');
+    const btnToggleSyncScroll = document.getElementById('btnToggleSyncScroll');
+    const btnMagicWand = document.getElementById('btnMagicWand');
+    const btnAcceptAllLeft = document.getElementById('btnAcceptAllLeft');
+    const btnAcceptAllRight = document.getElementById('btnAcceptAllRight');
+    const btnPrevConflict = document.getElementById('btnPrevConflict');
+    const btnNextConflict = document.getElementById('btnNextConflict');
+    const btnSaveStage = document.getElementById('btnSaveStage');
+
+    function showToast(msg) {
+      const toast = document.getElementById('toast');
+      toast.textContent = msg;
+      toast.style.display = 'block';
+      setTimeout(() => { toast.style.display = 'none'; }, 2500);
+    }
+
+    function init() {
+      resultTextarea.value = state.resultContent;
+      renderPanes();
+      updateConflictCount();
+      setupScrollSync();
+      setupEvents();
+    }
+
+    function escapeHtml(text) {
+      return text
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+    }
+
+    function renderPanes() {
+      renderLeftPane();
+      renderRightPane();
+      renderCenterGutter();
+    }
+
+    function renderLeftPane() {
+      const lines = state.leftContent.split('\n');
+      let gutterHtml = '';
+      let codeHtml = '';
+      let actionHtml = '';
+
+      lines.forEach((line, idx) => {
+        const lineNum = idx + 1;
+        gutterHtml += '<div class="line-number">' + lineNum + '</div>';
+
+        const chunk = state.chunks.find(c => lineNum >= c.leftStartLine && lineNum <= c.leftEndLine);
+        let highlightClass = '';
+        if (chunk) {
+          highlightClass = chunk.type === 'conflict' ? 'conflict-highlight' : 'left-diff-highlight';
+        }
+
+        codeHtml += '<div class="code-line ' + highlightClass + '" id="left-line-' + lineNum + '">' + escapeHtml(line || ' ') + '</div>';
+
+        if (chunk && lineNum === chunk.leftStartLine) {
+          actionHtml += '<div class="action-btn-slot"><div class="apply-btn apply-left" title="Accept Left" onclick="resolveChunk(\'' + chunk.id + '\', \'left\')">»</div><div class="apply-btn ignore-btn" title="Ignore" onclick="resolveChunk(\'' + chunk.id + '\', \'ignore\')">✕</div></div>';
+        } else {
+          actionHtml += '<div class="action-btn-slot"></div>';
+        }
+      });
+
+      gutterLeft.innerHTML = gutterHtml;
+      codeLeft.innerHTML = codeHtml;
+      actionGutterLeft.innerHTML = actionHtml;
+    }
+
+    function renderRightPane() {
+      const lines = state.rightContent.split('\n');
+      let gutterHtml = '';
+      let codeHtml = '';
+      let actionHtml = '';
+
+      lines.forEach((line, idx) => {
+        const lineNum = idx + 1;
+        gutterHtml += '<div class="line-number">' + lineNum + '</div>';
+
+        const chunk = state.chunks.find(c => lineNum >= c.rightStartLine && lineNum <= c.rightEndLine);
+        let highlightClass = '';
+        if (chunk) {
+          highlightClass = chunk.type === 'conflict' ? 'conflict-highlight' : 'right-diff-highlight';
+        }
+
+        codeHtml += '<div class="code-line ' + highlightClass + '" id="right-line-' + lineNum + '">' + escapeHtml(line || ' ') + '</div>';
+
+        if (chunk && lineNum === chunk.rightStartLine) {
+          actionHtml += '<div class="action-btn-slot"><div class="apply-btn ignore-btn" title="Ignore" onclick="resolveChunk(\'' + chunk.id + '\', \'ignore\')">✕</div><div class="apply-btn apply-right" title="Accept Right" onclick="resolveChunk(\'' + chunk.id + '\', \'right\')">«</div></div>';
+        } else {
+          actionHtml += '<div class="action-btn-slot"></div>';
+        }
+      });
+
+      gutterRight.innerHTML = gutterHtml;
+      codeRight.innerHTML = codeHtml;
+      actionGutterRight.innerHTML = actionHtml;
+    }
+
+    function renderCenterGutter() {
+      const lines = resultTextarea.value.split('\n');
+      let gutterHtml = '';
+      for (let i = 1; i <= lines.length; i++) {
+        gutterHtml += '<div class="line-number">' + i + '</div>';
+      }
+      gutterCenter.innerHTML = gutterHtml;
+    }
+
+    window.resolveChunk = function(chunkId, choice) {
+      const chunk = state.chunks.find(c => c.id === chunkId);
+      if (!chunk) return;
+
+      chunk.resolved = true;
+      chunk.chosen = choice;
+
+      let chosenText = '';
+      if (choice === 'left') {
+        chosenText = chunk.leftContent;
+      } else if (choice === 'right') {
+        chosenText = chunk.rightContent;
+      } else if (choice === 'ignore') {
+        chosenText = '';
+      }
+
+      let currentResult = resultTextarea.value;
+      const markerPattern = new RegExp('/\\* CONFLICT #' + chunk.id.replace('chunk-', '') + ':[^\\*]+\\*/', 'g');
+
+      if (markerPattern.test(currentResult)) {
+        currentResult = currentResult.replace(markerPattern, chosenText);
+      }
+
+      resultTextarea.value = currentResult;
+      renderCenterGutter();
+      updateConflictCount();
+      showToast('Resolved chunk: accepted ' + choice);
+    };
+
+    function runMagicWand() {
+      let resolvedCount = 0;
+      state.chunks.forEach(chunk => {
+        if (!chunk.resolved) {
+          if (chunk.type === 'diff-left') {
+            resolveChunk(chunk.id, 'left');
+            resolvedCount++;
+          } else if (chunk.type === 'diff-right') {
+            resolveChunk(chunk.id, 'right');
+            resolvedCount++;
+          }
+        }
+      });
+      showToast('Magic Wand applied! ' + resolvedCount + ' non-conflicting change(s) auto-resolved.');
+    }
+
+    function acceptAll(side) {
+      state.chunks.forEach(chunk => {
+        resolveChunk(chunk.id, side);
+      });
+      showToast('Accepted all changes from ' + (side === 'left' ? 'Left' : 'Right'));
+    }
+
+    function updateConflictCount() {
+      const markerMatches = (resultTextarea.value.match(/\/\\* CONFLICT #\d+/g) || []).length;
+      const count = markerMatches;
+
+      if (count === 0) {
+        statusBadge.className = 'status-badge all-resolved';
+        conflictCountIcon.textContent = '✔';
+        conflictCountText.textContent = 'All conflicts resolved!';
+      } else {
+        statusBadge.className = 'status-badge has-conflicts';
+        conflictCountIcon.textContent = '⚡';
+        conflictCountText.textContent = count + ' conflict' + (count > 1 ? 's' : '') + ' remaining';
+      }
+    }
+
+    let isSyncing = false;
+    function setupScrollSync() {
+      const sync = (source, targets) => {
+        if (!state.syncScroll || isSyncing) return;
+        isSyncing = true;
+        const ratio = source.scrollTop / (source.scrollHeight - source.clientHeight || 1);
+        targets.forEach(target => {
+          if (target) {
+            target.scrollTop = ratio * (target.scrollHeight - target.clientHeight);
+          }
+        });
+        setTimeout(() => { isSyncing = false; }, 20);
+      };
+
+      scrollLeft.addEventListener('scroll', () => sync(scrollLeft, [scrollCenter, scrollRight]));
+      scrollRight.addEventListener('scroll', () => sync(scrollRight, [scrollLeft, scrollCenter]));
+      resultTextarea.addEventListener('scroll', () => {
+        gutterCenter.scrollTop = resultTextarea.scrollTop;
+        sync(resultTextarea, [scrollLeft, scrollRight]);
+      });
+    }
+
+    function scrollToConflict(index) {
+      if (state.chunks.length === 0) return;
+      if (index < 0) index = state.chunks.length - 1;
+      if (index >= state.chunks.length) index = 0;
+      state.currentConflictIndex = index;
+
+      const chunk = state.chunks[index];
+      if (chunk) {
+        const leftEl = document.getElementById('left-line-' + chunk.leftStartLine);
+        if (leftEl) {
+          leftEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+      }
+    }
+
+    function setLayout(layout) {
+      state.layout = layout;
+      if (layout === '3col') {
+        mergeBody.className = 'merge-body layout-3col';
+        btnLayout3Col.classList.add('active');
+        btnLayout2Row.classList.remove('active');
+        mergeBody.innerHTML = '';
+        mergeBody.appendChild(document.getElementById('paneLeft'));
+        mergeBody.appendChild(document.getElementById('paneCenter'));
+        mergeBody.appendChild(document.getElementById('paneRight'));
+      } else {
+        mergeBody.className = 'merge-body layout-2row';
+        btnLayout2Row.classList.add('active');
+        btnLayout3Col.classList.remove('active');
+        mergeBody.innerHTML = '<div class="top-row" id="topRow"></div><div class="bottom-row" id="bottomRow"></div>';
+        const topRow = document.getElementById('topRow');
+        const bottomRow = document.getElementById('bottomRow');
+        topRow.appendChild(document.getElementById('paneLeft'));
+        topRow.appendChild(document.getElementById('paneRight'));
+        bottomRow.appendChild(document.getElementById('paneCenter'));
+      }
+    }
+
+    function setupEvents() {
+      resultTextarea.addEventListener('input', () => {
+        renderCenterGutter();
+        updateConflictCount();
+      });
+
+      btnLayout3Col.addEventListener('click', () => setLayout('3col'));
+      btnLayout2Row.addEventListener('click', () => setLayout('2row'));
+
+      btnToggleSyncScroll.addEventListener('click', () => {
+        state.syncScroll = !state.syncScroll;
+        btnToggleSyncScroll.classList.toggle('active', state.syncScroll);
+      });
+
+      btnMagicWand.addEventListener('click', runMagicWand);
+      btnAcceptAllLeft.addEventListener('click', () => acceptAll('left'));
+      btnAcceptAllRight.addEventListener('click', () => acceptAll('right'));
+
+      btnPrevConflict.addEventListener('click', () => scrollToConflict(state.currentConflictIndex - 1));
+      btnNextConflict.addEventListener('click', () => scrollToConflict(state.currentConflictIndex + 1));
+
+      btnSaveStage.addEventListener('click', () => {
+        showToast('🎉 All changes saved and staged with git add!');
+      });
+    }
+
+    init();
+  </script>
+</body>
+</html>
