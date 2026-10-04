@@ -137,10 +137,42 @@ export function activate(context: vscode.ExtensionContext) {
     }, 200);
   };
 
+  // CodeLens Provider to show inline button above <<<<<<< conflict markers
+  const codeLensProvider: vscode.CodeLensProvider = {
+    provideCodeLenses(document: vscode.TextDocument): vscode.CodeLens[] {
+      const lenses: vscode.CodeLens[] = [];
+      const text = document.getText();
+      if (!hasGitConflictMarkers(text)) {
+        return lenses;
+      }
+
+      for (let i = 0; i < document.lineCount; i++) {
+        const line = document.lineAt(i);
+        if (line.text.startsWith('<<<<<<<')) {
+          const range = new vscode.Range(i, 0, i, line.text.length);
+          lenses.push(
+            new vscode.CodeLens(range, {
+              title: 'Open WebStorm Merge GUI',
+              command: 'webstorm-merge.resolveCurrentFile',
+              arguments: [document.uri]
+            })
+          );
+        }
+      }
+      return lenses;
+    }
+  };
+
+  const codeLensDisposable = vscode.languages.registerCodeLensProvider(
+    { scheme: 'file' },
+    codeLensProvider
+  );
+
   context.subscriptions.push(
     resolveCurrentCmd,
     scanAndResolveCmd,
     conflictStatusBarItem,
+    codeLensDisposable,
     vscode.window.onDidChangeActiveTextEditor(editor => {
       void applyConflictContext(editor);
     }),

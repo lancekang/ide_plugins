@@ -11,6 +11,18 @@ import {
   serializeMerge
 } from '../src/diffEngine.js';
 import { GitService, parseConflictedPaths } from '../src/gitService.js';
+import { highlightLine, languageFromFileName } from '../src/highlight.js';
+
+assert.equal(languageFromFileName('Foo.TS'), 'javascript');
+assert.equal(languageFromFileName('readme.md'), 'markdown');
+assert.equal(languageFromFileName('notes'), 'plain');
+const colored = highlightLine('const x = "<b>";', 'javascript');
+assert.equal(colored.includes('<b>'), false);
+assert.ok(colored.includes('&lt;b&gt;'));
+assert.ok(colored.includes('tok-keyword'));
+assert.ok(colored.includes('tok-string'));
+assert.ok(highlightLine('<<<<<<< WMERGE chunk-1 >>>>>>>', 'javascript').includes('tok-sentinel'));
+assert.ok(highlightLine('# comment', 'python').includes('tok-comment'));
 
 function mainLines(analysis: { initialResult: string }): string {
   return analysis.initialResult;

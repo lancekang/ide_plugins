@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import * as fs from 'fs';
 import { ConflictChunk, MergeBlock, MergeFileData } from './types.js';
 import { describeUnresolved, serializeMerge } from './diffEngine.js';
+import { highlightLine, languageFromFileName } from './highlight.js';
 import { GitService } from './gitService.js';
 
 function escapeHtml(value: string): string {
@@ -440,35 +441,102 @@ export class MergePanel {
     .hunk.conflict { background: var(--conflict-bg); }
     .hunk.diff-left { background: var(--ours-bg); }
     .hunk.diff-right { background: var(--theirs-bg); }
+    .hunk.pickable { cursor: pointer; }
+    .hunk.side-left.picked {
+      background: var(--ours-bg);
+      box-shadow: inset 0 0 0 2px var(--ours, var(--focus));
+    }
+    .hunk.side-right.picked {
+      background: var(--theirs-bg);
+      box-shadow: inset 0 0 0 2px var(--theirs, var(--focus));
+    }
+    .hunk.dimmed { opacity: 0.55; }
+    .hunk-actions .btn.active {
+      background: var(--button-bg);
+      color: var(--button-fg);
+      box-shadow: inset 0 0 0 1px var(--focus);
+    }
 
     .code-line, .result-area, #lineProbe {
       font-family: var(--font-code);
       font-size: var(--font-size);
       line-height: var(--row-h);
+      font-variant-ligatures: none;
+      font-feature-settings: "liga" 0, "calt" 0;
     }
 
     .code-line {
       height: var(--row-h);
       white-space: pre;
       padding: 0 8px;
+      overflow: hidden;
     }
+
+    .code-line span { line-height: inherit; }
 
     .code-line.pad { color: var(--muted); }
 
-    .result-area {
+    .result-editor {
+      position: relative;
+      width: 100%;
+      overflow: hidden;
+    }
+
+    .result-hl, .result-area {
       display: block;
       width: 100%;
       margin: 0;
-      padding: 0 8px;
       border: 0;
-      resize: none;
+      tab-size: 2;
       overflow: hidden;
+    }
+
+    .result-hl {
+      position: absolute;
+      inset: 0;
+      padding: 0;
+      pointer-events: none;
+      color: var(--fg);
+    }
+
+    .result-area {
+      position: absolute;
+      inset: 0;
+      padding: 0 8px;
       white-space: pre;
+      resize: none;
       background: transparent;
-      color: inherit;
+      color: transparent;
+      caret-color: var(--fg);
     }
 
     .result-area:focus { outline: none; }
+
+    .result-area::selection {
+      background: var(--vscode-editor-selectionBackground);
+      color: transparent;
+    }
+
+    .fold-btn {
+      display: block;
+      width: 100%;
+      height: var(--row-h);
+      line-height: var(--row-h);
+      text-align: center;
+      background: var(--header-bg);
+      color: var(--muted);
+      border: 0;
+      border-top: 1px solid var(--border-color);
+      border-bottom: 1px solid var(--border-color);
+      cursor: pointer;
+      font-size: 11px;
+    }
+
+    .tok-keyword { color: var(--vscode-symbolIcon-keywordForeground, var(--vscode-textLink-foreground)); }
+    .tok-string { color: var(--vscode-debugTokenExpression-string, var(--vscode-charts-orange)); }
+    .tok-number { color: var(--vscode-debugTokenExpression-number, var(--vscode-charts-green)); }
+    .tok-comment { color: var(--vscode-descriptionForeground); }
+    .tok-sentinel { color: var(--vscode-editorWarning-foreground); }
 
     .status-bar {
       border-top: 1px solid var(--border-color);
@@ -513,6 +581,7 @@ export class MergePanel {
       <button id="btnMagicWand" class="btn" type="button" title="Re-apply every one-sided change">Apply non-conflicts</button>
       <button id="btnAcceptAllLeft" class="btn" type="button">Accept all ours</button>
       <button id="btnAcceptAllRight" class="btn" type="button">Accept all theirs</button>
+      <button id="btnShowBase" class="btn" type="button" title="Show the common ancestor inside each change">Base</button>
     </div>
     <div class="toolbar-right">
       <div class="toggle-group">
@@ -538,13 +607,19 @@ export class MergePanel {
     </section>
   </div>
   <div class="status-bar">
-    <div><kbd>F7</kbd> next <kbd>Shift+F7</kbd> previous <kbd>Ctrl+S</kbd> stage <kbd>Tab</kbd> indent</div>
+    <div><kbd>F7</kbd> next <kbd>Shift+F7</kbd> previous <kbd>Alt+1</kbd> ours <kbd>Alt+2</kbd> theirs <kbd>Alt+3</kbd> both <kbd>Alt+4</kbd> base <kbd>Ctrl+S</kbd> stage</div>
     <div>${escapeHtml(sourceLabel)}</div>
   </div>
   <script>
     const vscode = acquireVsCodeApi();
     const rawData = ${rawDataJson};
     const ACTION = 28;
+    const FOLD_AT = 12;
+    const FOLD_EDGE = 3;
+    const LINE_WINDOW = 80;
+    const HIGHLIGHT_MAX = 800;
+    const lang = ${JSON.stringify(languageFromFileName(data.fileName))};
+    const highlightLine = ${highlightLine.toString()};
 
     const state = {
       chunks: rawData.chunks || [],
@@ -552,8 +627,12 @@ export class MergePanel {
       eol: rawData.eol === '\\r\\n' ? '\\r\\n' : '\\n',
       trailingNewline: !!rawData.trailingNewline,
       syncScroll: true,
+      showBase: false,
       currentId: ''
     };
+    state.blocks.forEach(function (block) {
+      if (block.kind === 'context' && block.lines.length > FOLD_AT) block.folded = true;
+    });
 
     const mergeBody = document.getElementById('mergeBody');
     const scrollLeft = document.getElementById('scrollLeft');
@@ -594,9 +673,29 @@ export class MergePanel {
       return chunk ? chunk.resultLines : [];
     }
 
-    function displayRows(block) {
-      if (block.kind === 'context') return Math.max(block.lines.length, 1);
-      const chunk = chunkById(block.chunkId);
+    function highlightText(text) {
+      const lines = String(text || '').split('\\n');
+      const color = lines.length <= HIGHLIGHT_MAX;
+      return lines.map(function (line) {
+        const body = color ? highlightLine(line, lang) : escapeHtml(line || ' ');
+        return '<div class="code-line">' + body + '</div>';
+      }).join('');
+    }
+
+    function chunkOf(block) {
+      return block && block.chunkId ? chunkById(block.chunkId) : null;
+    }
+
+    function isFoldable(block) {
+      return block.kind === 'context' && block.lines.length > FOLD_AT;
+    }
+
+    function contentRows(block) {
+      if (block.kind === 'context') {
+        if (block.folded && isFoldable(block)) return FOLD_EDGE * 2;
+        return Math.max(block.lines.length, 1);
+      }
+      const chunk = chunkOf(block);
       if (!chunk) return 1;
       return Math.max(
         splitContent(chunk.leftContent).length,
@@ -606,9 +705,25 @@ export class MergePanel {
       );
     }
 
+    function baseSectionRows(block) {
+      if (!state.showBase || block.kind !== 'hunk') return 0;
+      const chunk = chunkOf(block);
+      const count = chunk ? splitContent(chunk.baseContent).length : 0;
+      return 1 + Math.max(count, 1);
+    }
+
     function blockPixelHeight(block) {
+      let rows = contentRows(block) + baseSectionRows(block);
+      if (isFoldable(block)) rows += 1;
       const action = block.kind === 'hunk' ? ACTION : 0;
-      return action + displayRows(block) * rowH;
+      return action + rows * rowH;
+    }
+
+    function linesTop(block, blockTop) {
+      let top = blockTop;
+      if (block.kind === 'hunk') top += ACTION + baseSectionRows(block) * rowH;
+      if (isFoldable(block) && !(block.folded)) top += rowH;
+      return top;
     }
 
     function collectLines() {
@@ -662,75 +777,276 @@ export class MergePanel {
       return splitContent(chunk.baseContent);
     }
 
-    function renderLines(lines, rows, emptyLabel) {
-      let html = '';
-      const count = Math.max(rows, 1);
-      for (let i = 0; i < count; i++) {
+    function rowWindow(totalRows, blockTop, scrollTop, viewHeight) {
+      const overscan = 30;
+      const first = Math.floor((scrollTop - blockTop) / rowH) - overscan;
+      const count = Math.ceil((viewHeight || rowH) / rowH) + overscan * 2;
+      const start = Math.max(0, Math.min(totalRows, first));
+      const end = Math.max(start, Math.min(totalRows, first + count));
+      return {
+        start: start,
+        end: end,
+        topPad: start * rowH,
+        bottomPad: (totalRows - end) * rowH
+      };
+    }
+
+    function renderPlainLines(lines, rows, emptyLabel, windowed, blockTop, scrollTop, viewHeight) {
+      const total = Math.max(rows, 1);
+      let start = 0;
+      let end = total;
+      let topPad = 0;
+      let bottomPad = 0;
+      if (windowed && total > LINE_WINDOW && viewHeight) {
+        const win = rowWindow(total, blockTop, scrollTop, viewHeight);
+        start = win.start;
+        end = win.end;
+        topPad = win.topPad;
+        bottomPad = win.bottomPad;
+      }
+      let html = topPad ? '<div style="height:' + topPad + 'px"></div>' : '';
+      for (let i = start; i < end; i++) {
         if (i < lines.length) {
-          html += '<div class="code-line">' + escapeHtml(lines[i].length ? lines[i] : ' ') + '</div>';
+          html += '<div class="code-line">' + highlightLine(lines[i].length ? lines[i] : ' ', lang) + '</div>';
         } else if (i === 0 && lines.length === 0) {
           html += '<div class="code-line pad">' + escapeHtml(emptyLabel) + '</div>';
         } else {
-          html += '<div class="code-line pad"></div>';
+          html += '<div class="code-line"></div>';
         }
       }
+      if (bottomPad) html += '<div style="height:' + bottomPad + 'px"></div>';
       return html;
+    }
+
+    function foldButton(block, index) {
+      if (!isFoldable(block)) return '';
+      const hidden = block.lines.length - FOLD_EDGE * 2;
+      const label = block.folded ? ('Show ' + hidden + ' unchanged lines') : 'Collapse unchanged lines';
+      return '<button type="button" class="fold-btn" data-fold="' + index + '">' + label + '</button>';
+    }
+
+    function baseSection(block, scrollTop, viewHeight, blockTop) {
+      if (!baseSectionRows(block)) return '';
+      const chunk = chunkOf(block);
+      const lines = chunk ? splitContent(chunk.baseContent) : [];
+      const top = blockTop + (block.kind === 'hunk' ? ACTION : 0);
+      return '<div class="code-line pad">Base</div>' +
+        renderPlainLines(lines, Math.max(lines.length, 1), 'no base', true, top + rowH, scrollTop, viewHeight);
     }
 
     function hunkClass(chunk) {
       return 'block hunk ' + (chunk ? chunk.type : 'conflict') + (chunk && state.currentId === chunk.id ? ' active' : '');
     }
 
-    function renderSide(side) {
-      return state.blocks.map(function (block, index) {
-        const height = blockPixelHeight(block);
-        if (block.kind === 'context') {
-          return '<div class="block" data-block="' + index + '" style="height:' + height + 'px">' +
-            renderLines(block.lines, displayRows(block), '') + '</div>';
-        }
-        const chunk = chunkById(block.chunkId);
-        const lines = chunk ? sideLines(chunk, side) : [];
-        const label = side === 'left' ? 'Ours' : 'Theirs';
-        const act = side === 'left' ? 'left' : 'right';
-        return '<div class="' + hunkClass(chunk) + '" data-block="' + index + '" data-chunk="' + (chunk ? chunk.id : '') + '" style="height:' + height + 'px">' +
-          '<div class="hunk-actions"><button type="button" class="btn" data-act="' + act + '" data-id="' + (chunk ? chunk.id : '') + '">' + label + '</button></div>' +
-          renderLines(lines, displayRows(block), 'no lines') + '</div>';
-      }).join('');
+    function resultBox(index, text, height) {
+      const rows = textareaToLines(text).length;
+      return '<div class="result-editor" data-block="' + index + '" style="height:' + height + 'px">' +
+        '<div class="result-hl">' + highlightText(text) + '</div>' +
+        '<textarea class="result-area" data-block="' + index + '" data-rows="' + rows + '" spellcheck="false">' +
+        escapeHtml(text) + '</textarea></div>';
     }
 
-    function renderCenter() {
-      return state.blocks.map(function (block, index) {
-        const height = blockPixelHeight(block);
-        const textHeight = height - (block.kind === 'hunk' ? ACTION : 0);
-        if (block.kind === 'context') {
-          return '<div class="block" data-block="' + index + '" style="height:' + height + 'px">' +
-            '<textarea class="result-area" data-block="' + index + '" spellcheck="false" style="height:' + textHeight + 'px">' +
-            escapeHtml(block.lines.join('\\n')) + '</textarea></div>';
+    function contextBody(block, index, scrollTop, viewHeight, blockTop, editable) {
+      if (block.folded && isFoldable(block)) {
+        const top = block.lines.slice(0, FOLD_EDGE);
+        const bottom = block.lines.slice(block.lines.length - FOLD_EDGE);
+        return renderPlainLines(top, FOLD_EDGE, '', false, 0, 0, 0) +
+          foldButton(block, index) +
+          renderPlainLines(bottom, FOLD_EDGE, '', false, 0, 0, 0);
+      }
+      const lineTop = linesTop(block, blockTop);
+      const linesHtml = '<div class="line-window" data-block="' + index + '" data-side="context">' +
+        renderPlainLines(block.lines, contentRows(block), '', true, lineTop, scrollTop, viewHeight) +
+        '</div>';
+      if (!editable) {
+        return foldButton(block, index) + linesHtml;
+      }
+      return foldButton(block, index) + resultBox(index, block.lines.join('\\n'), contentRows(block) * rowH);
+    }
+
+    function isSidePicked(chunk, side) {
+      if (!chunk) return false;
+      if (chunk.chosen === 'both') return true;
+      return chunk.chosen === side;
+    }
+
+    function sideMark(chunk, side) {
+      if (!chunk || chunk.chosen === 'none' || chunk.chosen === 'custom') return '';
+      return isSidePicked(chunk, side) ? ' picked' : ' dimmed';
+    }
+
+    function choiceButton(label, act, id, on) {
+      return '<button type="button" class="btn' + (on ? ' active' : '') + '" data-act="' + act + '" data-id="' + id + '" aria-pressed="' + (on ? 'true' : 'false') + '">' + label + '</button>';
+    }
+
+    function renderSideBlock(side, block, index, scrollTop, viewHeight, blockTop) {
+      const height = blockPixelHeight(block);
+      if (block.kind === 'context') {
+        return '<div class="block" data-block="' + index + '" style="height:' + height + 'px">' +
+          contextBody(block, index, scrollTop, viewHeight, blockTop, false) + '</div>';
+      }
+      const chunk = chunkOf(block);
+      const lines = chunk ? sideLines(chunk, side) : [];
+      const label = side === 'left' ? 'Ours' : 'Theirs';
+      const act = side === 'left' ? 'left' : 'right';
+      const id = chunk ? chunk.id : '';
+      const lineTop = linesTop(block, blockTop);
+      const sideClass = side === 'left' ? ' side-left' : ' side-right';
+      return '<div class="' + hunkClass(chunk) + sideClass + sideMark(chunk, side) + ' pickable" data-act="' + act + '" data-id="' + id + '" data-block="' + index + '" data-chunk="' + id + '" style="height:' + height + 'px">' +
+        '<div class="hunk-actions">' + choiceButton(label, act, id, isSidePicked(chunk, side)) + '</div>' +
+        baseSection(block, scrollTop, viewHeight, blockTop) +
+        '<div class="line-window" data-block="' + index + '" data-side="' + side + '">' +
+        renderPlainLines(lines, contentRows(block), 'no lines', true, lineTop, scrollTop, viewHeight) +
+        '</div></div>';
+    }
+
+    function renderCenterBlock(block, index, scrollTop, viewHeight, blockTop) {
+      const height = blockPixelHeight(block);
+      if (block.kind === 'context') {
+        return '<div class="block" data-block="' + index + '" style="height:' + height + 'px">' +
+          contextBody(block, index, scrollTop, viewHeight, blockTop, true) + '</div>';
+      }
+      const chunk = chunkOf(block);
+      if (!chunk) {
+        return '<div class="block" data-block="' + index + '" style="height:' + height + 'px"></div>';
+      }
+      return '<div class="' + hunkClass(chunk) + '" data-block="' + index + '" data-chunk="' + chunk.id + '" style="height:' + height + 'px">' +
+        '<div class="hunk-actions">' +
+        choiceButton('Both', 'both', chunk.id, chunk.chosen === 'both') +
+        choiceButton('Base', 'base', chunk.id, chunk.chosen === 'base') +
+        '</div>' +
+        baseSection(block, scrollTop, viewHeight, blockTop) +
+        resultBox(index, chunk.resultLines.join('\\n'), contentRows(block) * rowH) +
+        '</div>';
+    }
+
+    function measureLayout() {
+      const boxes = [];
+      let top = 0;
+      for (let i = 0; i < state.blocks.length; i++) {
+        const height = blockPixelHeight(state.blocks[i]);
+        boxes.push({ index: i, top: top, height: height });
+        top += height;
+      }
+      return { boxes: boxes, total: top };
+    }
+
+    function blockRange(scrollTop, viewHeight, layout) {
+      if (!viewHeight || layout.total <= viewHeight + 1200) {
+        return { start: 0, end: layout.boxes.length, topSpacer: 0, bottomSpacer: 0 };
+      }
+      const y0 = Math.max(0, scrollTop - 600);
+      const y1 = scrollTop + viewHeight + 600;
+      let start = 0;
+      let end = layout.boxes.length;
+      for (let i = 0; i < layout.boxes.length; i++) {
+        const box = layout.boxes[i];
+        if (box.top + box.height < y0) start = i + 1;
+        if (box.top > y1) {
+          end = i;
+          break;
         }
-        const chunk = chunkById(block.chunkId);
-        if (!chunk) {
-          return '<div class="block" data-block="' + index + '" style="height:' + height + 'px"></div>';
+      }
+      if (start > end) start = end;
+      const topSpacer = start < layout.boxes.length ? layout.boxes[start].top : layout.total;
+      const bottomSpacer = end > 0
+        ? layout.total - (layout.boxes[end - 1].top + layout.boxes[end - 1].height)
+        : 0;
+      return { start: start, end: end, topSpacer: topSpacer, bottomSpacer: bottomSpacer };
+    }
+
+    function renderPane(side, scroller, layout) {
+      const view = scroller.clientHeight || 0;
+      const range = blockRange(scroller.scrollTop, view, layout);
+      let html = '<div class="spacer" style="height:' + range.topSpacer + 'px"></div>';
+      for (let i = range.start; i < range.end; i++) {
+        const box = layout.boxes[i];
+        const block = state.blocks[box.index];
+        html += side === 'center'
+          ? renderCenterBlock(block, box.index, scroller.scrollTop, view, box.top)
+          : renderSideBlock(side, block, box.index, scroller.scrollTop, view, box.top);
+      }
+      html += '<div class="spacer" style="height:' + range.bottomSpacer + 'px"></div>';
+      return html;
+    }
+
+    function rangeKey(scroller, layout) {
+      const range = blockRange(scroller.scrollTop, scroller.clientHeight || 0, layout);
+      return range.start + ':' + range.end;
+    }
+
+    function captureFocus() {
+      const active = document.activeElement;
+      if (!active || !active.getAttribute || !active.classList || !active.classList.contains('result-area')) return null;
+      return {
+        block: active.getAttribute('data-block'),
+        start: active.selectionStart,
+        end: active.selectionEnd
+      };
+    }
+
+    function restoreFocus(saved) {
+      if (!saved) return;
+      const area = scrollCenter.querySelector('textarea[data-block="' + saved.block + '"]');
+      if (!area) return;
+      area.focus();
+      area.selectionStart = saved.start;
+      area.selectionEnd = saved.end;
+    }
+
+    let builtRange = '';
+
+    function refreshLineWindows() {
+      const layout = measureLayout();
+      document.querySelectorAll('.line-window').forEach(function (el) {
+        const index = Number(el.getAttribute('data-block'));
+        const side = el.getAttribute('data-side');
+        const pane = el.closest('.pane-scroll');
+        const box = layout.boxes[index];
+        const block = state.blocks[index];
+        if (!pane || !box || !block) return;
+        let lines = block.lines;
+        if (side === 'left' || side === 'right') {
+          const chunk = chunkOf(block);
+          lines = chunk ? sideLines(chunk, side) : [];
         }
-        const value = chunk.resultLines.join('\\n');
-        return '<div class="' + hunkClass(chunk) + '" data-block="' + index + '" data-chunk="' + chunk.id + '" style="height:' + height + 'px">' +
-          '<div class="hunk-actions">' +
-          '<button type="button" class="btn" data-act="both" data-id="' + chunk.id + '">Both</button>' +
-          '<button type="button" class="btn" data-act="base" data-id="' + chunk.id + '">Base</button>' +
-          '</div>' +
-          '<textarea class="result-area" data-block="' + index + '" spellcheck="false" style="height:' + textHeight + 'px">' +
-          escapeHtml(value) + '</textarea></div>';
-      }).join('');
+        el.innerHTML = renderPlainLines(
+          lines,
+          contentRows(block),
+          side === 'context' ? '' : 'no lines',
+          true,
+          linesTop(block, box.top),
+          pane.scrollTop,
+          pane.clientHeight || 0
+        );
+      });
     }
 
     function render() {
+      const focus = captureFocus();
+      const layout = measureLayout();
       const tops = [scrollLeft.scrollTop, scrollCenter.scrollTop, scrollRight.scrollTop];
-      scrollLeft.innerHTML = renderSide('left');
-      scrollRight.innerHTML = renderSide('right');
-      scrollCenter.innerHTML = renderCenter();
+      isSyncing = true;
+      scrollLeft.innerHTML = renderPane('left', scrollLeft, layout);
+      scrollRight.innerHTML = renderPane('right', scrollRight, layout);
+      scrollCenter.innerHTML = renderPane('center', scrollCenter, layout);
       scrollLeft.scrollTop = tops[0];
       scrollCenter.scrollTop = tops[1];
       scrollRight.scrollTop = tops[2];
+      isSyncing = false;
+      builtRange = rangeKey(scrollLeft, layout) + '|' + rangeKey(scrollCenter, layout) + '|' + rangeKey(scrollRight, layout);
+      restoreFocus(focus);
       updateConflictCount();
+    }
+
+    function renderIfRangeChanged() {
+      const layout = measureLayout();
+      const key = rangeKey(scrollLeft, layout) + '|' + rangeKey(scrollCenter, layout) + '|' + rangeKey(scrollRight, layout);
+      if (key === builtRange) {
+        refreshLineWindows();
+        return;
+      }
+      render();
     }
 
     function textareaToLines(value) {
@@ -738,18 +1054,10 @@ export class MergePanel {
       return value.split('\\n');
     }
 
-    function resizeBlock(index) {
-      const block = state.blocks[index];
-      if (!block) return;
-      const height = blockPixelHeight(block);
-      document.querySelectorAll('[data-block="' + index + '"]').forEach(function (el) {
-        el.style.height = height + 'px';
-      });
-      const area = scrollCenter.querySelector('textarea[data-block="' + index + '"]');
-      if (area) {
-        const action = block.kind === 'hunk' ? ACTION : 0;
-        area.style.height = (height - action) + 'px';
-      }
+    function currentConflictId() {
+      if (state.currentId && unresolvedIds().indexOf(state.currentId) >= 0) return state.currentId;
+      const open = unresolvedIds();
+      return open.length ? open[0] : (state.chunks[0] ? state.chunks[0].id : '');
     }
 
     function resolveChunk(id, choice) {
@@ -804,13 +1112,14 @@ export class MergePanel {
       if (index < 0) index = delta > 0 ? -1 : 0;
       index = (index + delta + ids.length) % ids.length;
       state.currentId = ids[index];
-      const el = scrollLeft.querySelector('[data-chunk="' + state.currentId + '"]');
-      if (!el) return;
+      const blockIndex = state.blocks.findIndex(function (block) { return block.chunkId === state.currentId; });
+      const layout = measureLayout();
+      const top = layout.boxes[blockIndex] ? layout.boxes[blockIndex].top : 0;
       isSyncing = true;
-      scrollLeft.scrollTop = el.offsetTop;
-      scrollCenter.scrollTop = el.offsetTop;
-      scrollRight.scrollTop = el.offsetTop;
-      setTimeout(function () { isSyncing = false; }, 30);
+      scrollLeft.scrollTop = top;
+      scrollCenter.scrollTop = top;
+      scrollRight.scrollTop = top;
+      isSyncing = false;
       render();
     }
 
@@ -826,16 +1135,19 @@ export class MergePanel {
 
     function bindScroll(source, targets) {
       source.addEventListener('scroll', function () {
-        if (!state.syncScroll || isSyncing) return;
-        isSyncing = true;
-        targets.forEach(function (target) { target.scrollTop = source.scrollTop; });
-        setTimeout(function () { isSyncing = false; }, 20);
+        if (isSyncing) return;
+        if (state.syncScroll) {
+          isSyncing = true;
+          targets.forEach(function (target) { target.scrollTop = source.scrollTop; });
+          isSyncing = false;
+        }
+        renderIfRangeChanged();
       });
     }
 
     function init() {
       const probe = document.getElementById('lineProbe');
-      const measured = probe.getBoundingClientRect().height;
+      const measured = Math.round(probe.getBoundingClientRect().height);
       if (measured > 0) {
         rowH = measured;
         document.documentElement.style.setProperty('--row-h', rowH + 'px');
@@ -848,6 +1160,9 @@ export class MergePanel {
         banner.textContent = 'The working tree has edits without conflict markers. Saving asks before overwrite.';
       }
       render();
+      if (window.requestAnimationFrame) {
+        window.requestAnimationFrame(function () { render(); });
+      }
       bindScroll(scrollLeft, [scrollCenter, scrollRight]);
       bindScroll(scrollRight, [scrollLeft, scrollCenter]);
       bindScroll(scrollCenter, [scrollLeft, scrollRight]);
@@ -855,6 +1170,14 @@ export class MergePanel {
       document.body.addEventListener('click', function (event) {
         const target = event.target;
         if (!target || !target.closest) return;
+        const fold = target.closest('[data-fold]');
+        if (fold) {
+          const index = Number(fold.getAttribute('data-fold'));
+          const block = state.blocks[index];
+          if (block) block.folded = !block.folded;
+          render();
+          return;
+        }
         const button = target.closest('[data-act]');
         if (!button) return;
         resolveChunk(button.getAttribute('data-id'), button.getAttribute('data-act'));
@@ -877,8 +1200,16 @@ export class MergePanel {
           if (chunk.resolved) chunk.chosen = 'custom';
           else chunk.chosen = 'none';
         }
-        resizeBlock(index);
-        updateConflictCount();
+        const pre = area.parentElement && area.parentElement.querySelector('.result-hl');
+        if (pre) pre.innerHTML = highlightText(area.value);
+        const prevRows = Number(area.getAttribute('data-rows'));
+        if (nextLines.length !== prevRows) {
+          const focus = { block: String(index), start: area.selectionStart, end: area.selectionEnd };
+          render();
+          restoreFocus(focus);
+        } else {
+          updateConflictCount();
+        }
       });
 
       btnLayout3Col.addEventListener('click', function () {
@@ -901,6 +1232,11 @@ export class MergePanel {
       document.getElementById('btnPrevConflict').addEventListener('click', function () { jump(-1); });
       document.getElementById('btnNextConflict').addEventListener('click', function () { jump(1); });
       document.getElementById('btnSaveStage').addEventListener('click', save);
+      document.getElementById('btnShowBase').addEventListener('click', function () {
+        state.showBase = !state.showBase;
+        document.getElementById('btnShowBase').classList.toggle('active', state.showBase);
+        render();
+      });
 
       window.addEventListener('keydown', function (event) {
         if ((event.ctrlKey || event.metaKey) && event.key === 's') {
@@ -915,6 +1251,15 @@ export class MergePanel {
           const end = area.selectionEnd;
           area.setRangeText('  ', start, end, 'end');
           area.dispatchEvent(new Event('input', { bubbles: true }));
+          return;
+        }
+        if (event.altKey && !event.ctrlKey && !event.metaKey && ['1', '2', '3', '4'].indexOf(event.key) >= 0) {
+          const choice = { '1': 'left', '2': 'right', '3': 'both', '4': 'base' }[event.key];
+          const id = currentConflictId();
+          if (id && choice) {
+            event.preventDefault();
+            resolveChunk(id, choice);
+          }
           return;
         }
         if (event.key === 'F7') {

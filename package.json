@@ -27,7 +27,9 @@
     "diff"
   ],
   "activationEvents": [
-    "onStartupFinished"
+    "onStartupFinished",
+    "onCommand:webstorm-merge.resolveCurrentFile",
+    "onCommand:webstorm-merge.scanAndResolve"
   ],
   "main": "./dist/extension.js",
   "contributes": {
