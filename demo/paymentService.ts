@@ -2,20 +2,21 @@ export interface PaymentRequest {
   orderId: string;
   amount: number;
   currency: string;
+  usePoints?: boolean;
 }
 
 export class PaymentService {
   /**
-   * Process payment transaction
+   * Process payment transaction with Loyalty Points (Branch B by Bob)
    */
   public async processPayment(req: PaymentRequest): Promise<boolean> {
-    console.log(`Processing payment for order ${req.orderId}...`);
+    console.log(`[Branch-B] Processing payment for order ${req.orderId} (Use Points: ${req.usePoints})...`);
 
-    // Standard VAT calculation
-    const vatRate = 0.10;
-    const finalAmount = req.amount * (1 + vatRate);
+    // Bob: Deduct 2,000 KRW points reward + 10% standard VAT
+    const pointDeduction = req.usePoints ? 2000 : 0;
+    const finalAmount = Math.max(0, req.amount - pointDeduction) * 1.10;
 
-    // Transaction execution
+    // Transaction execution with Bob's payment gateway
     const success = await this.executeGateway(req.orderId, finalAmount);
     return success;
   }
