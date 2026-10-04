@@ -104,7 +104,18 @@ export function activate(context: vscode.ExtensionContext) {
     }
 
     const text = editor.document.getText();
-    if (hasGitConflictMarkers(text)) {
+    let hasConflict = hasGitConflictMarkers(text);
+
+    if (!hasConflict) {
+      const gitRoot = await GitService.findGitRoot(editor.document.uri.fsPath);
+      if (gitRoot) {
+        const conflicts = await GitService.getConflictedFiles(gitRoot);
+        const currentPath = editor.document.uri.fsPath.toLowerCase();
+        hasConflict = conflicts.some(c => c.fsPath.toLowerCase() === currentPath);
+      }
+    }
+
+    if (hasConflict) {
       conflictStatusBarItem.text = '$(git-merge) WebStorm Merge';
       conflictStatusBarItem.tooltip = 'Open the 3-way merge view for this file';
       conflictStatusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
